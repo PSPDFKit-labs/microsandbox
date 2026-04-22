@@ -21,14 +21,15 @@
     "node": ">= 18"
   },
   "scripts": {
-    "build": "napi build --release --platform --js index.cjs --dts index.d.cts",
-    "build:debug": "napi build --platform --js index.cjs --dts index.d.cts",
+    "build": "napi build --release --platform --js index.cjs --dts index.d.cts && tsc",
+    "build:debug": "napi build --platform --js index.cjs --dts index.d.cts && tsc",
     "test": "vitest run",
     "postinstall": "node postinstall.js"
   },
   "devDependencies": {
     "@napi-rs/cli": "^3",
     "@types/node": "^25.5.2",
+    "typescript": "^6.0.3",
     "vitest": "^4.1"
   },
   "optionalDependencies": {
@@ -43,6 +44,8 @@
     "postinstall.js",
     "bin/microsandbox.js",
     "lib/install.js",
+    "dist/egress-intercept.js",
+    "dist/egress-intercept.d.ts",
     "README.md"
   ]
 }

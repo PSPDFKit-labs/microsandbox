@@ -21,6 +21,6 @@ export const {
   isInstalled,
 } = binding;
 
-export { egressIntercept } from "./lib/egress-intercept.ts";
+export { egressIntercept } from "./dist/egress-intercept.js";
 
 export default binding;
