@@ -1,8 +1,11 @@
 name: Release
 
 on:
-  push:
-    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g. 0.3.14-pspdfkit.1)"
+        required: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -211,8 +214,9 @@ jobs:
       - name: Build Node SDK
         working-directory: sdk/node-ts
         run: |
-          npm install
-          npm run build -- --target ${{ matrix.napi_target }}
+          npm ci
+          npx napi build --release --platform --js index.cjs --dts index.d.cts --target ${{ matrix.napi_target }}
+          npx tsc
 
       - name: Upload Node SDK artifacts
         uses: actions/upload-artifact@v4
@@ -222,6 +226,7 @@ jobs:
             sdk/node-ts/${{ matrix.node_file }}
             sdk/node-ts/index.cjs
             sdk/node-ts/index.d.cts
+            sdk/node-ts/dist/
 
       # -- Python SDK --
       - uses: astral-sh/setup-uv@v3
@@ -313,32 +318,17 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${{ github.ref_name }}" \
-            --title "${{ github.ref_name }}" \
+          gh release create "v${{ inputs.version }}" \
+            --title "v${{ inputs.version }}" \
             --generate-notes \
             release-artifacts/*
 
   # ---------------------------------------------------------------------------
-  # Sync mintlify branch to the released commit
+  # Upload Node SDK artifacts to GitHub Release
   # ---------------------------------------------------------------------------
-  sync-mintlify:
-    name: Sync mintlify branch
+  node-sdk-release:
+    name: Upload Node SDK to Release
     needs: assemble
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Hard reset mintlify to release commit
-        run: git push --force origin ${{ github.sha }}:refs/heads/mintlify
-
-  # ---------------------------------------------------------------------------
-  # Publish Node SDK to npm
-  # ---------------------------------------------------------------------------
-  npm-publish:
-    name: Publish npm packages
-    needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -346,7 +336,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          registry-url: https://registry.npmjs.org
 
       - name: Download Node SDK artifacts
         uses: actions/download-artifact@v4
@@ -354,116 +343,50 @@ jobs:
           path: node-artifacts
           pattern: node-sdk-*
 
-      - name: Place binaries and update generated files
+      - name: Package Node SDK tarballs
         run: |
-          # Copy .node binaries into platform packages.
-          cp node-artifacts/node-sdk-darwin-arm64/microsandbox.darwin-arm64.node sdk/node-ts/npm/darwin-arm64/
-          cp node-artifacts/node-sdk-linux-x64-gnu/microsandbox.linux-x64-gnu.node sdk/node-ts/npm/linux-x64-gnu/
-          cp node-artifacts/node-sdk-linux-arm64-gnu/microsandbox.linux-arm64-gnu.node sdk/node-ts/npm/linux-arm64-gnu/
-
-          # Copy build-generated index.cjs and index.d.cts into root package
-          # (use darwin-arm64 — all platforms produce identical JS/types).
-          cp node-artifacts/node-sdk-darwin-arm64/index.cjs sdk/node-ts/index.cjs
-          cp node-artifacts/node-sdk-darwin-arm64/index.d.cts sdk/node-ts/index.d.cts
-
-      - name: Publish platform packages
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
+          mkdir -p node-release
+          # Copy tsc output (platform-independent, same across all builds)
+          cp -r node-artifacts/node-sdk-darwin-arm64/dist sdk/node-ts/
           for dir in darwin-arm64 linux-x64-gnu linux-arm64-gnu; do
-            echo "Publishing @superradcompany/microsandbox-$dir..."
-            cd sdk/node-ts/npm/$dir
-            npm publish --access public
-            cd ../../../..
+            # Copy platform binary and generated JS into sdk/node-ts
+            cp node-artifacts/node-sdk-${dir}/microsandbox.*.node sdk/node-ts/
+            cp node-artifacts/node-sdk-${dir}/index.cjs sdk/node-ts/
+            cp node-artifacts/node-sdk-${dir}/index.d.cts sdk/node-ts/
+
+            # Patch version and add .node binary to files list so npm pack includes it
+            node -e "
+              const fs = require('fs');
+              const pkg = JSON.parse(fs.readFileSync('sdk/node-ts/package.json', 'utf8'));
+              pkg.version = '${{ inputs.version }}';
+              pkg.files = [...pkg.files, '*.node'];
+              fs.writeFileSync('sdk/node-ts/package.json', JSON.stringify(pkg, null, 2));
+            "
+
+            # npm pack creates a proper installable tarball
+            cd sdk/node-ts
+            npm pack
+            cd ../..
+            mv sdk/node-ts/microsandbox-*.tgz "node-release/microsandbox-node-sdk-${dir}.tgz"
+
+            # Restore package.json for next iteration
+            git checkout sdk/node-ts/package.json
+            rm -f sdk/node-ts/microsandbox.*.node
           done
 
-      - name: Wait for npm to index platform packages
-        run: sleep 30
-
-      - name: Publish root package
+      - name: Upload to GitHub Release
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        working-directory: sdk/node-ts
-        run: npm publish --access public
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "v${{ inputs.version }}" node-release/*.tgz
 
   # ---------------------------------------------------------------------------
-  # Publish MCP server to npm
+  # Upload Python SDK wheels to GitHub Release
   # ---------------------------------------------------------------------------
-  mcp-publish:
-    name: Publish MCP server
-    needs: npm-publish
+  python-sdk-release:
+    name: Upload Python wheels to Release
+    needs: assemble
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: true
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          registry-url: https://registry.npmjs.org
-
-      - name: Build and publish MCP server
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        working-directory: mcp
-        run: |
-          rm package-lock.json
-          npm install
-          npm run build
-          npm publish --access public
-
-  # ---------------------------------------------------------------------------
-  # Publish Rust crates to crates.io
-  # ---------------------------------------------------------------------------
-  crates-publish:
-    name: Publish crates
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: true
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Publish to crates.io
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: |
-          for crate in \
-            microsandbox-utils \
-            microsandbox-protocol \
-            microsandbox-db \
-            microsandbox-migration \
-            microsandbox-image \
-            microsandbox-filesystem \
-            microsandbox-network \
-            microsandbox-runtime \
-            microsandbox \
-            microsandbox-cli; do
-            echo "Publishing $crate..."
-            cargo publish -p "$crate" --no-verify
-            sleep 60
-          done
-
-  # ---------------------------------------------------------------------------
-  # Publish Python SDK to PyPI
-  # ---------------------------------------------------------------------------
-  pypi-publish:
-    name: Publish Python SDK
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      id-token: write
-    environment:
-      name: pypi
-      url: https://pypi.org/p/microsandbox
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: astral-sh/setup-uv@v3
-
       - name: Download Python SDK wheels
         uses: actions/download-artifact@v4
         with:
@@ -474,8 +397,10 @@ jobs:
       - name: List wheels
         run: ls -lh dist/
 
-      - name: Publish to PyPI
-        run: uv publish dist/*.whl
+      - name: Upload to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "v${{ inputs.version }}" dist/*.whl
 
   # ---------------------------------------------------------------------------
   # Publish Docker image to GHCR
@@ -530,7 +455,7 @@ jobs:
           platforms: linux/${{ matrix.arch }}
           cache-from: type=gha,scope=${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
-          outputs: type=image,name=ghcr.io/superradcompany/microsandbox,push-by-digest=true,name-canonical=true,push=true
+          outputs: type=image,name=ghcr.io/pspdfkit-labs/microsandbox,push-by-digest=true,name-canonical=true,push=true
 
       - name: Export digest
         run: |
@@ -567,17 +492,16 @@ jobs:
       - uses: docker/metadata-action@v5
         id: meta
         with:
-          images: ghcr.io/superradcompany/microsandbox
+          images: ghcr.io/pspdfkit-labs/microsandbox
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=${{ inputs.version }}
             type=raw,value=latest
 
       - name: Create multi-arch manifest
         run: |
           AMD64_DIGEST=$(cat digests/amd64.txt)
           ARM64_DIGEST=$(cat digests/arm64.txt)
-          IMAGE=ghcr.io/superradcompany/microsandbox
+          IMAGE=ghcr.io/pspdfkit-labs/microsandbox
 
           for TAG in $(echo "${{ steps.meta.outputs.tags }}"); do
             docker buildx imagetools create -t "$TAG" \

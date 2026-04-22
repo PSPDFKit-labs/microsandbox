@@ -18,13 +18,13 @@ microsandbox publishes multi-arch Docker images (amd64/arm64) to GitHub Containe
 ## Pull the image
 
 ```bash
-docker pull ghcr.io/superradcompany/microsandbox:latest
+docker pull ghcr.io/pspdfkit-labs/microsandbox:latest
 ```
 
 Or pin to a specific version:
 
 ```bash
-docker pull ghcr.io/superradcompany/microsandbox:0.3.14
+docker pull ghcr.io/pspdfkit-labs/microsandbox:0.3.14
 ```
 
 ## Run a sandbox
@@ -33,7 +33,7 @@ The container requires `--privileged` and `/dev/kvm` access to run microVMs:
 
 ```bash
 docker run --privileged --device /dev/kvm \
-  ghcr.io/superradcompany/microsandbox:latest \
+  ghcr.io/pspdfkit-labs/microsandbox:latest \
   run python --name my-sandbox --replace
 ```
 
@@ -44,7 +44,7 @@ By default, sandbox data (images, cache, databases) is stored inside the contain
 ```bash
 docker run --privileged --device /dev/kvm \
   -v microsandbox_data:/root/.microsandbox \
-  ghcr.io/superradcompany/microsandbox:latest \
+  ghcr.io/pspdfkit-labs/microsandbox:latest \
   run python --name my-sandbox --replace
 ```
 

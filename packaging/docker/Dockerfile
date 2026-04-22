@@ -1,6 +1,6 @@
 FROM ubuntu:24.04
 
-LABEL org.opencontainers.image.source="https://github.com/superradcompany/microsandbox"
+LABEL org.opencontainers.image.source="https://github.com/PSPDFKit-labs/microsandbox"
 LABEL org.opencontainers.image.description="Secure microVM sandboxes for running untrusted code"
 LABEL org.opencontainers.image.licenses="Apache-2.0"
 

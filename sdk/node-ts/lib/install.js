@@ -15,7 +15,7 @@ const http = require("http");
 const PREBUILT_VERSION = require("../package.json").version;
 const LIBKRUNFW_ABI = "5";
 const LIBKRUNFW_VERSION = "5.2.1";
-const GITHUB_ORG = "superradcompany";
+const GITHUB_ORG = "pspdfkit-labs";
 const REPO = "microsandbox";
 const BASE_DIR = path.join(os.homedir(), ".microsandbox");
 const BIN_DIR = path.join(BASE_DIR, "bin");
@@ -72,7 +72,7 @@ function isInstalled() {
   const libkrunfw = libkrunfwFilename(targetOS);
   return (
     fs.existsSync(path.join(LIB_DIR, libkrunfw)) &&
-    installedMsbVersion(path.join(BIN_DIR, "msb")) === PREBUILT_VERSION
+    PREBUILT_VERSION.startsWith(installedMsbVersion(path.join(BIN_DIR, "msb")) ?? "\0")
   );
 }
 

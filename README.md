@@ -18,7 +18,7 @@
 <br />
 
 <div align='center'>
-  <a href="https://github.com/superradcompany/microsandbox/releases"><img src="https://img.shields.io/github/v/release/superradcompany/microsandbox?include_prereleases&style=for-the-badge" alt="GitHub release"></a>
+  <a href="https://github.com/PSPDFKit-labs/microsandbox/releases"><img src="https://img.shields.io/github/v/release/PSPDFKit-labs/microsandbox?include_prereleases&style=for-the-badge" alt="GitHub release"></a>
   <a href="https://discord.gg/T95Y3XnEAK"><img src="https://img.shields.io/discord/1315784565562019870?label=Discord&logo=discord&logoColor=white&color=5865F2&style=for-the-badge" alt="Discord"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache 2.0-blue.svg?style=for-the-badge" alt="Apache 2.0 License"></a>
 </div>
@@ -44,14 +44,17 @@
 
 #### <img height="14" src="https://octicons-col.vercel.app/move-to-bottom/A770EF">&nbsp;&nbsp;Install the SDK
 
-> ```sh
-> cargo add microsandbox    # 🦀 Rust
+> ```toml
+> # Rust (Cargo.toml)
+> microsandbox = { git = "https://github.com/PSPDFKit-labs/microsandbox.git", tag = "v0.3.14" }
 > ```
 > ```sh
-> uv add microsandbox       # 🐍 Python
+> # Python
+> pip install https://github.com/PSPDFKit-labs/microsandbox/releases/download/v0.3.14/microsandbox-0.3.14-linux_x86_64.whl
 > ```
 > ```sh
-> npm i microsandbox        # 🟦 TypeScript
+> # TypeScript
+> npm install https://github.com/PSPDFKit-labs/microsandbox/releases/download/v0.3.14/microsandbox-node-sdk-linux-x64-gnu.tgz
 > ```
 
 #### <img height="14" src="https://octicons-col.vercel.app/download/A770EF">&nbsp;&nbsp;Install the CLI **(Optional)**
@@ -65,7 +68,7 @@
 > Or install the `msb` command globally:
 >
 > ```sh
-> curl -fsSL https://install.microsandbox.dev | sh
+> curl -fsSL https://raw.githubusercontent.com/PSPDFKit-labs/microsandbox/main/scripts/install.sh | sh
 > ```
 >
 > ```sh

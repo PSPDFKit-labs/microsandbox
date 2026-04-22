@@ -7,7 +7,7 @@ set -eu
 # Constants
 # ---------------------------------------------------------------------------
 
-GITHUB_REPO="superradcompany/microsandbox"
+GITHUB_REPO="PSPDFKit-labs/microsandbox"
 INSTALL_DIR="$HOME/.microsandbox"
 BIN_DIR="$INSTALL_DIR/bin"
 LIB_DIR="$INSTALL_DIR/lib"

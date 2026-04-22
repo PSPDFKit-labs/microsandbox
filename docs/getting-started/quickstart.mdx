@@ -21,20 +21,21 @@ icon: "bolt"
     The SDK **embeds the runtime directly**, so no separate server process is needed. Only install the `msb` CLI if you want to manage images, volumes, and sandboxes from the terminal.
 
     <CodeGroup>
-    ```bash Rust
-    cargo add microsandbox
+    ```toml Rust (Cargo.toml)
+    [dependencies]
+    microsandbox = { git = "https://github.com/PSPDFKit-labs/microsandbox.git", tag = "v0.3.14" }
     ```
 
     ```bash TypeScript
-    npm install microsandbox
+    npm install https://github.com/PSPDFKit-labs/microsandbox/releases/download/v0.3.14/microsandbox-node-sdk-linux-x64-gnu.tgz
     ```
 
     ```bash Python
-    pip install microsandbox
+    pip install https://github.com/PSPDFKit-labs/microsandbox/releases/download/v0.3.14/microsandbox-0.3.14-linux_x86_64.whl
     ```
 
     ```bash CLI
-    curl -fsSL https://install.microsandbox.dev | sh
+    gh release download -R PSPDFKit-labs/microsandbox -p 'microsandbox-*.tar.gz'
     ```
 
     </CodeGroup>
