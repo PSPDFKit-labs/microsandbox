@@ -54,7 +54,8 @@
             "icon": "network-wired",
             "pages": [
               "networking/overview",
-              "networking/tls"
+              "networking/tls",
+              "networking/egress"
             ]
           },
           {

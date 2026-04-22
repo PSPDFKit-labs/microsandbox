@@ -13,6 +13,7 @@ if "MSB_PATH" not in _os.environ:
         _os.environ["MSB_PATH"] = str(_bundled_msb)
 
 from microsandbox._microsandbox import (
+    EgressConnection,
     ExecHandle,
     ExecOutput,
     ExecSink,
@@ -33,6 +34,7 @@ from microsandbox._microsandbox import (
     is_installed,
     version,
 )
+from microsandbox.egress_intercept import egress_intercept
 from microsandbox.errors import (
     ExecFailedError,
     ExecTimeoutError,
@@ -53,6 +55,9 @@ from microsandbox.errors import (
     VolumeNotFoundError,
 )
 from microsandbox.events import (
+    EgressContext,
+    EgressHttpRequest,
+    EgressHttpResponse,
     ExecEvent,
     ExitedEvent,
     LayerDownloadComplete,
@@ -167,6 +172,12 @@ __all__ = [
     "SecretEntry",
     "TlsConfig",
     "ViolationAction",
+    # Egress interception
+    "EgressConnection",
+    "EgressHttpRequest",
+    "EgressHttpResponse",
+    "EgressContext",
+    "egress_intercept",
     # Images / rootfs
     "Image",
     "ImageSource",

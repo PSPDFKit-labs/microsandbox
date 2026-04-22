@@ -1,0 +1,267 @@
+---
+title: Egress Interception
+description: Inspect and modify outbound HTTP traffic
+icon: "arrow-right-from-bracket"
+---
+
+Egress interception gives your SDK code visibility into every outbound HTTP request and response leaving the sandbox. Before a request reaches the server, your `onRequest` hook sees it. Before the response reaches the guest, your `onResponse` hook sees it. From those hooks you can pass through, modify, short-circuit with a synthetic response, or block outright.
+
+This is useful for logging, content filtering, injecting headers (trace IDs, auth tokens), mocking external APIs during testing, and enforcing application-level policies that go beyond network-layer rules.
+
+## Intercepting traffic
+
+Enable interception by specifying which hosts to intercept. Use `"*"` for all hosts. This automatically enables [TLS interception](/networking/tls) on the intercepted connections.
+
+<CodeGroup>
+```rust Rust
+use microsandbox::Sandbox;
+use microsandbox::sandbox::egress::{EgressConnection, RequestAction};
+
+let sb = Sandbox::builder("agent")
+    .image("python")
+    .network(|n| n.egress_intercept_host("*"))
+    .build_and_start()
+    .await?;
+
+let mut conn = sb.egress_connection().await?;
+conn.intercept(
+    |req, ctx| {
+        println!("→ {} {} [{}]", req.method, req.uri, ctx.sni);
+        req.headers.push(("X-Trace-Id".into(), "abc123".into()));
+        Ok(Some(RequestAction::Forward(req.clone())))
+    },
+    |resp, _req, ctx| {
+        println!("← {} [{}]", resp.status, ctx.sni);
+        Ok(None) // pass through
+    },
+)
+.await?;
+```
+
+```typescript TypeScript
+import { Sandbox, egressIntercept } from 'microsandbox'
+
+const sb = await Sandbox.create({
+    name: "agent",
+    image: "python",
+    network: {
+        egressInterceptHosts: ["*"],
+    },
+})
+
+await egressIntercept(sb, {
+    onRequest: async (request, ctx) => {
+        console.log(`→ ${request.method} ${request.uri} [${ctx.sni}]`)
+        request.headers.push(["X-Trace-Id", "abc123"])
+        return request // forward modified
+    },
+    onResponse: async (response, request, ctx) => {
+        console.log(`← ${response.status} [${ctx.sni}]`)
+        return undefined // pass through
+    },
+})
+```
+
+```python Python
+from microsandbox import Network, Sandbox, egress_intercept
+
+sb = await Sandbox.create(
+    "agent",
+    image="python",
+    network=Network(egress_intercept_hosts=["*"]),
+)
+
+async def on_request(request, ctx):
+    print(f"→ {request.method} {request.uri} [{ctx.sni}]")
+    request.headers.append(("X-Trace-Id", "abc123"))
+    return request  # forward modified
+
+async def on_response(response, request, ctx):
+    print(f"← {response.status} [{ctx.sni}]")
+    return None  # pass through
+
+await egress_intercept(sb, on_request=on_request, on_response=on_response)
+```
+</CodeGroup>
+
+## Hook actions
+
+What you return from each hook determines what happens to the traffic:
+
+| Return value | `onRequest` | `onResponse` |
+|---|---|---|
+| Nothing (`None` / `undefined`) | Pass through unchanged | Pass through unchanged |
+| Modified request | Forward the modified request to the server | — |
+| Response object | Short-circuit: return this response to the guest, skip the server | Forward the modified response to the guest |
+| Throw / raise error | Block the connection | Block the connection |
+
+## Short-circuiting requests
+
+Return a response object from `onRequest` to skip the server entirely. The guest receives your synthetic response as if the server sent it. This is useful for mocking external APIs during testing.
+
+<CodeGroup>
+```rust Rust
+use microsandbox::sandbox::egress::RequestAction;
+use microsandbox_network::egress::event::HttpResponse;
+
+conn.intercept(
+    |req, _ctx| {
+        if req.uri.starts_with("/api/v1/models") {
+            return Ok(Some(RequestAction::ShortCircuit(HttpResponse {
+                status: 200,
+                headers: vec![("Content-Type".into(), "application/json".into())],
+                body: Some(br#"{"models":["mock-model"]}"#.to_vec()),
+            })));
+        }
+        Ok(None) // pass through everything else
+    },
+    |_resp, _req, _ctx| Ok(None),
+)
+.await?;
+```
+
+```typescript TypeScript
+import { egressIntercept } from 'microsandbox'
+
+await egressIntercept(sb, {
+    onRequest: async (request, ctx) => {
+        if (request.uri.startsWith("/api/v1/models")) {
+            return {
+                status: 200,
+                headers: [["Content-Type", "application/json"]],
+                body: Buffer.from('{"models":["mock-model"]}'),
+            }
+        }
+        return undefined // pass through everything else
+    },
+})
+```
+
+```python Python
+from microsandbox import EgressHttpResponse, egress_intercept
+
+async def on_request(request, ctx):
+    if request.uri.startswith("/api/v1/models"):
+        return EgressHttpResponse(
+            status=200,
+            headers=[("Content-Type", "application/json")],
+            body=b'{"models":["mock-model"]}',
+        )
+    return None  # pass through everything else
+
+await egress_intercept(sb, on_request=on_request)
+```
+</CodeGroup>
+
+## Blocking requests
+
+Raise an error (or throw) from any hook to block the connection. The guest sees a connection reset.
+
+<CodeGroup>
+```rust Rust
+conn.intercept(
+    |req, _ctx| {
+        if req.uri.contains("/admin") {
+            return Err("blocked: admin endpoint".into());
+        }
+        Ok(None)
+    },
+    |_resp, _req, _ctx| Ok(None),
+)
+.await?;
+```
+
+```typescript TypeScript
+import { egressIntercept } from 'microsandbox'
+
+await egressIntercept(sb, {
+    onRequest: async (request, ctx) => {
+        if (request.uri.includes("/admin")) {
+            throw new Error("blocked: admin endpoint")
+        }
+        return undefined
+    },
+})
+```
+
+```python Python
+from microsandbox import egress_intercept
+
+async def on_request(request, ctx):
+    if "/admin" in request.uri:
+        raise Exception("blocked: admin endpoint")
+    return None
+
+await egress_intercept(sb, on_request=on_request)
+```
+</CodeGroup>
+
+## Filtering hosts
+
+You don't have to intercept everything. Specify the hosts you care about and the rest pass through without hitting your hooks:
+
+<CodeGroup>
+```rust Rust
+use microsandbox::Sandbox;
+
+let sb = Sandbox::builder("agent")
+    .image("python")
+    .network(|n| n
+        .egress_intercept_host("api.openai.com")
+        .egress_intercept_host("*.anthropic.com")
+    )
+    .build_and_start()
+    .await?;
+```
+
+```typescript TypeScript
+import { Sandbox } from 'microsandbox'
+
+const sb = await Sandbox.create({
+    name: "agent",
+    image: "python",
+    network: {
+        egressInterceptHosts: ["api.openai.com", "*.anthropic.com"],
+    },
+})
+```
+
+```python Python
+from microsandbox import Network, Sandbox
+
+sb = await Sandbox.create(
+    "agent",
+    image="python",
+    network=Network(
+        egress_intercept_hosts=["api.openai.com", "*.anthropic.com"],
+    ),
+)
+```
+</CodeGroup>
+
+## Configuration
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `egress_intercept_hosts` | `[]` (none) | Hosts to intercept. `"*"` for all. Supports exact match and `*.suffix` wildcards. |
+| `egress_max_body_bytes` | `67108864` (64 MiB) | Max body bytes per request/response. Requests exceeding this get `413 Payload Too Large`; responses get `502 Bad Gateway`. |
+| `egress_intercept_timeout_ms` | `5000` | Time the runtime waits for the SDK to send a decision. |
+| `egress_timeout_ms` | `300000` (5 min) | Per-connection wall-clock timeout for intercepted connections. Prevents SSE/streaming from hanging indefinitely. `0` to disable. |
+
+<Note>
+**Fail-open:** if the SDK doesn't respond within the decision timeout, the request is forwarded unchanged. This prevents a crashed or slow hook from blocking all traffic.
+</Note>
+
+<Note>
+**Body limits:** requests or responses whose body exceeds `egress_max_body_bytes` are rejected outright — the guest receives an HTTP error and the connection is closed. This prevents silent data corruption from modifying truncated bodies.
+</Note>
+
+<Note>
+**TLS interception** is enabled automatically when egress interception is configured. You don't need to set it separately.
+</Note>
+
+<Note>
+**Response buffering:** Responses with `Content-Length` or `Transfer-Encoding: chunked` are fully buffered — the `onResponse` hook receives the complete body and can modify it. Responses without either header (read-until-close) are buffered until the server closes the connection. SSE and other long-lived streaming responses are held back from the guest until the server closes or `egress_timeout_ms` fires. After a `101 Switching Protocols` response (WebSocket), both request and response hooks stop firing — the connection becomes an opaque tunnel.
+</Note>
+
+See the SDK Reference for the full API: [Rust](/sdk/rust/networking) | [TypeScript](/sdk/typescript/networking) | [Python](/sdk/python/networking).

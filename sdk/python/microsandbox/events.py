@@ -105,3 +105,30 @@ PullProgress: TypeAlias = (
     | LayerIndexStarted | LayerIndexComplete
     | PullComplete
 )
+
+#--------------------------------------------------------------------------------------------------
+# Types: Egress Interception Events
+#--------------------------------------------------------------------------------------------------
+
+@dataclass(slots=True)
+class EgressHttpRequest:
+    """A parsed HTTP request from the egress interception proxy."""
+    method: str
+    uri: str
+    headers: list[tuple[str, str]]
+    body: bytes | None = None
+
+@dataclass(slots=True)
+class EgressHttpResponse:
+    """A parsed HTTP response from the egress interception proxy."""
+    status: int
+    headers: list[tuple[str, str]]
+    body: bytes | None = None
+
+@dataclass(frozen=True, slots=True)
+class EgressContext:
+    """Connection metadata provided to egress hooks."""
+    sni: str
+    dst: str
+    connection_id: int
+    timestamp_ms: int

@@ -1,4 +1,5 @@
 mod config;
+mod egress;
 mod error;
 mod exec;
 mod fs;
@@ -39,6 +40,7 @@ fn _microsandbox(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<exec::PyExecEvent>()?;
     m.add_class::<fs::PyFsEntry>()?;
     m.add_class::<fs::PyFsMetadata>()?;
+    m.add_class::<egress::PyEgressConnection>()?;
     Ok(())
 }
 

@@ -532,6 +532,22 @@ fn apply_network(
         builder = builder.network(move |n| n.trust_host_cas(trust));
     }
 
+    // Egress interception — hosts auto-enable egress_intercept + TLS.
+    if let Some(hosts) = extract_opt::<Vec<String>>(net, "egress_intercept_hosts")? {
+        for host in hosts {
+            builder = builder.network(move |n| n.egress_intercept_host(&host));
+        }
+    }
+    if let Some(max) = extract_opt::<usize>(net, "egress_max_body_bytes")? {
+        builder = builder.network(move |n| n.egress_max_body_bytes(max));
+    }
+    if let Some(ms) = extract_opt::<u64>(net, "egress_intercept_timeout_ms")? {
+        builder = builder.network(move |n| n.egress_intercept_timeout_ms(ms));
+    }
+    if let Some(ms) = extract_opt::<u64>(net, "egress_timeout_ms")? {
+        builder = builder.network(move |n| n.egress_timeout_ms(ms));
+    }
+
     // Secret violation action (sandbox-level, not per-secret).
     if let Some(violation) = extract_opt::<String>(net, "on_secret_violation")? {
         let action = parse_violation_action(&violation)?;

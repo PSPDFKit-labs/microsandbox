@@ -2549,6 +2549,7 @@ version = "0.3.14"
 dependencies = [
  "bytes",
  "chrono",
+ "ciborium",
  "crossterm",
  "dbus",
  "dirs",
@@ -2669,12 +2670,14 @@ name = "microsandbox-network"
 version = "0.3.14"
 dependencies = [
  "bytes",
+ "ciborium",
  "core-foundation 0.9.4",
  "crossbeam-queue",
  "dirs",
  "futures",
  "hickory-client",
  "hickory-proto",
+ "httparse",
  "ipnetwork",
  "libc",
  "lru",

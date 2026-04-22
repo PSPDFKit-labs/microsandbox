@@ -149,6 +149,72 @@ Configure TLS interception. The closure receives a [`TlsBuilder`](#tlsbuilder) f
 
 ---
 
+#### egress_intercept_host()
+
+```rust
+fn egress_intercept_host(self, pattern: &str) -> Self
+```
+
+Add a host pattern to the egress intercept filter. Only connections matching at least one pattern will trigger hooks. Automatically enables egress and TLS interception. Can be called multiple times.
+
+Use `"*"` to intercept all hosts. Supports exact match and `*.suffix` wildcards.
+
+**Parameters**
+
+| Name | Type | Description |
+|------|------|-------------|
+| pattern | `&str` | Host pattern: `"*"`, exact domain, or `"*.suffix"` wildcard |
+
+---
+
+#### egress_max_body_bytes()
+
+```rust
+fn egress_max_body_bytes(self, max: usize) -> Self
+```
+
+Maximum body bytes to capture per request/response. Default: `67108864` (64 MiB).
+
+**Parameters**
+
+| Name | Type | Description |
+|------|------|-------------|
+| max | `usize` | Maximum body bytes |
+
+---
+
+#### egress_intercept_timeout_ms()
+
+```rust
+fn egress_intercept_timeout_ms(self, ms: u64) -> Self
+```
+
+Timeout for the SDK to respond with a decision. On timeout the request is forwarded unchanged (fail-open). Default: `5000`.
+
+**Parameters**
+
+| Name | Type | Description |
+|------|------|-------------|
+| ms | `u64` | Timeout in milliseconds |
+
+---
+
+#### egress_timeout_ms()
+
+```rust
+fn egress_timeout_ms(self, ms: u64) -> Self
+```
+
+Per-connection wall-clock timeout for intercepted connections. Prevents SSE/streaming from hanging indefinitely. Default: `300000` (5 minutes). Set to `0` to disable.
+
+**Parameters**
+
+| Name | Type | Description |
+|------|------|-------------|
+| ms | `u64` | Timeout in milliseconds |
+
+---
+
 ## DnsBuilder
 
 Builder for DNS interception settings. Used in `NetworkBuilder::dns(|d| d...)`.
@@ -358,6 +424,40 @@ Control whether the TLS proxy verifies the upstream server's certificate. When `
 
 ---
 
+## EgressConnection
+
+SDK-side connection to the runtime's egress interception socket. Obtained via [`Sandbox::egress_connection()`](/sdk/rust/sandbox). See [Egress Interception](/networking/egress) for conceptual overview.
+
+---
+
+#### intercept()
+
+```rust
+async fn intercept<F, G>(
+    &mut self,
+    on_request: F,
+    on_response: G,
+) -> io::Result<()>
+where
+    F: FnMut(&mut HttpRequest, &EgressContext) -> Result<Option<RequestAction>, Box<dyn Error>>,
+    G: FnMut(&mut HttpResponse, &HttpRequest, &EgressContext) -> Result<Option<HttpResponse>, Box<dyn Error>>,
+```
+
+Run the interception event loop with user-provided hooks. Blocks until the sandbox stops or the connection closes.
+
+**`on_request`** receives a mutable reference to the request and context:
+- Return `Ok(None)` to pass through unchanged
+- Return `Ok(Some(RequestAction::Forward(req)))` to forward a modified request
+- Return `Ok(Some(RequestAction::ShortCircuit(resp)))` to return a response without contacting the server
+- Return `Err(_)` to block the connection
+
+**`on_response`** receives a mutable reference to the response, the original request, and context:
+- Return `Ok(None)` to pass through unchanged
+- Return `Ok(Some(resp))` to forward a modified response
+- Return `Err(_)` to block the connection
+
+---
+
 ## Types
 
 ### Action
@@ -447,3 +547,40 @@ Action taken when a secret placeholder is sent to a disallowed host.
 | `Block` | Silently drop the request. The guest sees a connection reset. This is the default. |
 | `BlockAndLog` | Drop the request and emit a warning log on the host side. |
 | `BlockAndTerminate` | Drop the request, log an error, and shut down the entire sandbox. |
+
+### RequestAction
+
+Return type for egress request hooks.
+
+| Variant | Description |
+|---------|-------------|
+| `Forward(HttpRequest)` | Forward a (possibly modified) request to the server |
+| `ShortCircuit(HttpResponse)` | Return this response to the guest without contacting the server |
+
+### HttpRequest
+
+| Field | Type | Description |
+|-------|------|-------------|
+| method | `String` | HTTP method (e.g. `"GET"`, `"POST"`) |
+| uri | `String` | Request URI |
+| headers | `Vec<(String, String)>` | Header name-value pairs |
+| body | `Option<Vec<u8>>` | Request body (if captured) |
+
+### HttpResponse
+
+| Field | Type | Description |
+|-------|------|-------------|
+| status | `u16` | HTTP status code |
+| headers | `Vec<(String, String)>` | Header name-value pairs |
+| body | `Option<Vec<u8>>` | Response body (if captured) |
+
+### EgressContext
+
+Connection metadata extracted from an [`EgressEvent`](#egressevent).
+
+| Field | Type | Description |
+|-------|------|-------------|
+| sni | `String` | TLS Server Name Indication |
+| dst | `SocketAddr` | Destination address |
+| connection_id | `u64` | Connection ID |
+| timestamp_ms | `u64` | Event timestamp |

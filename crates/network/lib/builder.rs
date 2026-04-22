@@ -181,6 +181,48 @@ impl NetworkBuilder {
         self
     }
 
+    /// Add a host pattern to the egress intercept filter.
+    /// Only connections matching these hosts will trigger hooks.
+    /// Use `"*"` to intercept all hosts. Empty = no interception.
+    /// Automatically enables TLS interception.
+    pub fn egress_intercept_host(mut self, pattern: &str) -> Self {
+        if !self.config.tls.enabled {
+            self.config.tls.enabled = true;
+        }
+        if pattern == "*" {
+            self.config.egress_intercept_hosts.push(HostPattern::Any);
+        } else if pattern.starts_with("*.") {
+            self.config
+                .egress_intercept_hosts
+                .push(HostPattern::Wildcard(pattern.to_string()));
+        } else {
+            self.config
+                .egress_intercept_hosts
+                .push(HostPattern::Exact(pattern.to_string()));
+        }
+        self
+    }
+
+    /// Maximum body bytes to capture per request/response (default: 64 MiB).
+    pub fn egress_max_body_bytes(mut self, max: usize) -> Self {
+        self.config.egress_max_body_bytes = max;
+        self
+    }
+
+    /// Timeout (ms) for the SDK to respond with a decision (default: 5000).
+    pub fn egress_intercept_timeout_ms(mut self, ms: u64) -> Self {
+        self.config.egress_intercept_timeout_ms = ms;
+        self
+    }
+
+    /// Per-connection wall-clock timeout (ms) for intercepted connections.
+    /// Prevents SSE/streaming from hanging indefinitely. Default: 300000 (5 min).
+    /// Set to 0 to disable.
+    pub fn egress_timeout_ms(mut self, ms: u64) -> Self {
+        self.config.egress_timeout_ms = ms;
+        self
+    }
+
     /// Consume the builder and return the configuration.
     pub fn build(self) -> NetworkConfig {
         self.config

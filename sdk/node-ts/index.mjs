@@ -2,6 +2,7 @@
 import binding from "./index.cjs";
 
 export const {
+  EgressStream,
   ExecHandle,
   ExecOutput,
   ExecSink,
@@ -19,5 +20,7 @@ export const {
   install,
   isInstalled,
 } = binding;
+
+export { egressIntercept } from "./lib/egress-intercept.ts";
 
 export default binding;

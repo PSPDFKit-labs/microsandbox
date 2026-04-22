@@ -400,11 +400,160 @@ impl Sandbox {
         let sb = guard.take().ok_or_else(consumed_error)?;
         sb.remove_persisted().await.map_err(to_napi_error)
     }
+
+    /// Connect to the egress interception socket.
+    ///
+    /// Returns a low-level `EgressStream` for reading events and sending
+    /// decisions. Use the high-level `egressIntercept()` JS wrapper for
+    /// callback-style hooks.
+    ///
+    /// Requires `egressInterceptHosts` in the network configuration.
+    #[napi]
+    pub async fn egress_connection(&self) -> Result<JsEgressStream> {
+        let guard = self.inner.lock().await;
+        let sb = guard.as_ref().ok_or_else(consumed_error)?;
+        let conn = sb.egress_connection().await.map_err(to_napi_error)?;
+        Ok(JsEgressStream {
+            inner: Arc::new(Mutex::new(conn)),
+        })
+    }
+}
+
+/// Low-level egress interception stream.
+///
+/// Provides `recv()` to read egress events and `sendDecision()` to respond.
+/// For the high-level callback API, use the TypeScript `egressIntercept()` wrapper.
+#[napi(js_name = "EgressStream")]
+pub struct JsEgressStream {
+    inner: Arc<Mutex<microsandbox::sandbox::egress::EgressConnection>>,
 }
 
 //--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------
+
+#[napi]
+impl JsEgressStream {
+    /// Receive the next egress event. Returns `null` when the stream ends.
+    #[napi]
+    pub async fn recv(&self) -> Result<Option<EgressEvent>> {
+        let mut guard = self.inner.lock().await;
+        match guard.recv().await {
+            Ok(Some(event)) => Ok(Some(crate::egress::rust_event_to_js(&event))),
+            Ok(None) => Ok(None),
+            Err(e) => Err(napi::Error::from_reason(e.to_string())),
+        }
+    }
+
+    /// Send a pass-through decision for the given event.
+    #[napi]
+    pub async fn pass_through(&self, event_id: f64) -> Result<()> {
+        let mut guard = self.inner.lock().await;
+        guard
+            .send_decision(microsandbox_network::egress::event::EgressDecision {
+                id: event_id as u64,
+                action: microsandbox_network::egress::event::EgressAction::PassThrough,
+            })
+            .await
+            .map_err(|e| napi::Error::from_reason(e.to_string()))
+    }
+
+    /// Send a block decision for the given event.
+    #[napi]
+    pub async fn block(&self, event_id: f64) -> Result<()> {
+        let mut guard = self.inner.lock().await;
+        guard
+            .send_decision(microsandbox_network::egress::event::EgressDecision {
+                id: event_id as u64,
+                action: microsandbox_network::egress::event::EgressAction::Block,
+            })
+            .await
+            .map_err(|e| napi::Error::from_reason(e.to_string()))
+    }
+
+    /// Send a modified request decision.
+    #[napi]
+    pub async fn modify_request(&self, event_id: f64, request: EgressHttpRequest) -> Result<()> {
+        let mut guard = self.inner.lock().await;
+        let req = js_request_to_rust(&request);
+        guard
+            .send_decision(microsandbox_network::egress::event::EgressDecision {
+                id: event_id as u64,
+                action: microsandbox_network::egress::event::EgressAction::ModifyRequest(req),
+            })
+            .await
+            .map_err(|e| napi::Error::from_reason(e.to_string()))
+    }
+
+    /// Send a short-circuit decision (return response to guest, skip server).
+    #[napi]
+    pub async fn short_circuit(&self, event_id: f64, response: EgressHttpResponse) -> Result<()> {
+        let mut guard = self.inner.lock().await;
+        let resp = js_response_to_rust(&response);
+        guard
+            .send_decision(microsandbox_network::egress::event::EgressDecision {
+                id: event_id as u64,
+                action: microsandbox_network::egress::event::EgressAction::ShortCircuit(resp),
+            })
+            .await
+            .map_err(|e| napi::Error::from_reason(e.to_string()))
+    }
+
+    /// Send a modified response decision.
+    #[napi]
+    pub async fn modify_response(&self, event_id: f64, response: EgressHttpResponse) -> Result<()> {
+        let mut guard = self.inner.lock().await;
+        let resp = js_response_to_rust(&response);
+        guard
+            .send_decision(microsandbox_network::egress::event::EgressDecision {
+                id: event_id as u64,
+                action: microsandbox_network::egress::event::EgressAction::ModifyResponse(resp),
+            })
+            .await
+            .map_err(|e| napi::Error::from_reason(e.to_string()))
+    }
+}
+
+/// Convert a JS `EgressHttpRequest` to the Rust type.
+fn js_request_to_rust(req: &EgressHttpRequest) -> microsandbox_network::egress::event::HttpRequest {
+    microsandbox_network::egress::event::HttpRequest {
+        method: req.method.clone(),
+        uri: req.uri.clone(),
+        headers: req
+            .headers
+            .iter()
+            .filter_map(|pair| {
+                if pair.len() >= 2 {
+                    Some((pair[0].clone(), pair[1].clone()))
+                } else {
+                    None
+                }
+            })
+            .collect(),
+        body: req.body.as_ref().map(|b| b.to_vec()),
+    }
+}
+
+/// Convert a JS `EgressHttpResponse` to the Rust type.
+fn js_response_to_rust(
+    resp: &EgressHttpResponse,
+) -> microsandbox_network::egress::event::HttpResponse {
+    microsandbox_network::egress::event::HttpResponse {
+        status: resp.status as u16,
+        headers: resp
+            .headers
+            .iter()
+            .filter_map(|pair| {
+                if pair.len() >= 2 {
+                    Some((pair[0].clone(), pair[1].clone()))
+                } else {
+                    None
+                }
+            })
+            .collect(),
+        body: resp.body.as_ref().map(|b| b.to_vec()),
+    }
+}
 
 #[napi]
 impl JsMetricsStream {
@@ -639,6 +788,21 @@ async fn convert_config(config: SandboxConfig) -> Result<RustSandboxConfig> {
             }
             if let Some(trust) = network.trust_host_cas {
                 n = n.trust_host_cas(trust);
+            }
+            // Egress interception — hosts auto-enable egress_intercept + TLS.
+            if let Some(ref hosts) = network.egress_intercept_hosts {
+                for host in hosts {
+                    n = n.egress_intercept_host(host);
+                }
+            }
+            if let Some(max) = network.egress_max_body_bytes {
+                n = n.egress_max_body_bytes(max as usize);
+            }
+            if let Some(ms) = network.egress_intercept_timeout_ms {
+                n = n.egress_intercept_timeout_ms(ms as u64);
+            }
+            if let Some(ms) = network.egress_timeout_ms {
+                n = n.egress_timeout_ms(ms as u64);
             }
             n
         });

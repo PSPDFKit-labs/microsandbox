@@ -164,6 +164,7 @@ pub fn smoltcp_poll_loop(
     published_ports: Vec<PublishedPort>,
     max_connections: Option<usize>,
     tokio_handle: tokio::runtime::Handle,
+    egress_handle: Option<tls_proxy::EgressHandle>,
 ) {
     let mut device = SmoltcpDevice::new(shared.clone(), config.mtu);
     let mut iface = create_interface(&mut device, &config);
@@ -379,6 +380,7 @@ pub fn smoltcp_poll_loop(
                     conn.to_smoltcp,
                     shared.clone(),
                     tls_state.clone(),
+                    egress_handle.clone(),
                 );
                 continue;
             }

@@ -8,6 +8,7 @@
 mod attach;
 mod builder;
 mod config;
+pub mod egress;
 pub mod exec;
 pub mod fs;
 mod handle;
@@ -35,7 +36,7 @@ use microsandbox_image::{
 };
 
 use crate::{
-    MicrosandboxResult,
+    MicrosandboxError, MicrosandboxResult,
     agent::AgentClient,
     db::entity::{
         run as run_entity, sandbox as sandbox_entity, sandbox_rootfs as sandbox_rootfs_entity,
@@ -553,6 +554,41 @@ impl Sandbox {
         }
         // Normal drop runs — client reader task is aborted and
         // ProcessHandle drops without sending SIGTERM.
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Methods: Egress Interception
+//--------------------------------------------------------------------------------------------------
+
+impl Sandbox {
+    /// Connect to the egress interception socket.
+    ///
+    /// Returns an [`egress::EgressConnection`] that can be used to run the
+    /// `intercept()` event loop with `onRequest`/`onResponse` hooks.
+    ///
+    /// Requires `egress_intercept_hosts` to be configured (non-empty).
+    pub async fn egress_connection(&self) -> MicrosandboxResult<egress::EgressConnection> {
+        let global = crate::config::config();
+        let egress_sock = global
+            .sandboxes_dir()
+            .join(&self.config.name)
+            .join("runtime")
+            .join("egress.sock");
+
+        egress::EgressConnection::connect(&egress_sock)
+            .await
+            .map_err(|e| {
+                MicrosandboxError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "failed to connect to egress socket at {}: {}. \
+                         Are egress_intercept_hosts configured?",
+                        egress_sock.display(),
+                        e
+                    ),
+                ))
+            })
     }
 }
 

@@ -126,6 +126,64 @@ pub struct NetworkConfig {
     /// works behind corporate MITM proxies (Warp Zero Trust, Zscaler,
     /// etc.). Opt-in. Default: false.
     pub trust_host_cas: Option<bool>,
+    /// Only intercept connections to these hosts (SNI match).
+    /// Use `["*"]` for all hosts. Supports exact match and `*.suffix` wildcards.
+    /// Empty/omitted = no interception.
+    pub egress_intercept_hosts: Option<Vec<String>>,
+    /// Maximum body bytes to capture per request/response (default: 64 MiB).
+    pub egress_max_body_bytes: Option<u32>,
+    /// Timeout (ms) for the SDK to respond with a decision (default: 5000).
+    /// On timeout the request is forwarded unchanged (fail-open).
+    pub egress_intercept_timeout_ms: Option<u32>,
+    /// Per-connection wall-clock timeout (ms) for intercepted connections.
+    /// Prevents SSE/streaming from hanging indefinitely. Default: 300000 (5 min).
+    /// Set to 0 to disable.
+    pub egress_timeout_ms: Option<u32>,
+}
+
+/// An egress event received from the interception proxy.
+#[napi(object)]
+pub struct EgressEvent {
+    /// Event ID for sending decisions (pass to `passThrough()`, `block()`, etc.).
+    pub id: f64,
+    /// "request" or "response".
+    pub kind: String,
+    /// Server hostname from TLS SNI.
+    pub sni: String,
+    /// Destination address as "ip:port".
+    pub dst: String,
+    /// Connection identifier.
+    pub connection_id: f64,
+    /// Timestamp in milliseconds since Unix epoch.
+    pub timestamp_ms: f64,
+    /// HTTP request (present when kind = "request").
+    pub request: Option<EgressHttpRequest>,
+    /// HTTP response (present when kind = "response").
+    pub response: Option<EgressHttpResponse>,
+}
+
+/// An HTTP request from an egress event.
+#[napi(object)]
+pub struct EgressHttpRequest {
+    /// HTTP method (e.g., "GET", "POST").
+    pub method: String,
+    /// Request URI (e.g., "/api/v1/chat").
+    pub uri: String,
+    /// HTTP headers as [name, value] pairs.
+    pub headers: Vec<Vec<String>>,
+    /// Request body bytes.
+    pub body: Option<napi::bindgen_prelude::Buffer>,
+}
+
+/// An HTTP response from an egress event.
+#[napi(object)]
+pub struct EgressHttpResponse {
+    /// HTTP status code.
+    pub status: u32,
+    /// HTTP headers as [name, value] pairs.
+    pub headers: Vec<Vec<String>>,
+    /// Response body bytes.
+    pub body: Option<napi::bindgen_prelude::Buffer>,
 }
 
 /// DNS interception configuration.

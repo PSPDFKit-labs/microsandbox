@@ -11,10 +11,16 @@ use std::thread::JoinHandle;
 
 use msb_krun::backends::net::NetBackend;
 
+use std::path::PathBuf;
+
+use tokio::sync::mpsc;
+
 use crate::backend::SmoltcpBackend;
 use crate::config::NetworkConfig;
+use crate::egress::publisher::{self, EVENT_CHANNEL_CAPACITY, ProxyMessage, PublisherConfig};
 use crate::shared::{DEFAULT_QUEUE_CAPACITY, SharedState};
 use crate::stack::{self, PollLoopConfig};
+use crate::tls::proxy::EgressHandle;
 use crate::tls::state::TlsState;
 
 //--------------------------------------------------------------------------------------------------
@@ -54,6 +60,11 @@ pub struct SmoltcpNetwork {
 
     // TLS state (if enabled). Created in new(), used for ca_cert_pem().
     tls_state: Option<Arc<TlsState>>,
+
+    // Egress interception channel (if enabled).
+    egress_tx: Option<mpsc::Sender<ProxyMessage>>,
+    egress_rx: Option<mpsc::Receiver<ProxyMessage>>,
+    egress_sock_path: Option<PathBuf>,
 }
 
 /// Handle for installing host-side termination behavior into the network stack.
@@ -118,6 +129,13 @@ impl SmoltcpNetwork {
             None
         };
 
+        let (egress_tx, egress_rx) = if !config.egress_intercept_hosts.is_empty() {
+            let (tx, rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+
         Self {
             config,
             shared,
@@ -131,6 +149,9 @@ impl SmoltcpNetwork {
             guest_ipv6,
             gateway_ipv6,
             tls_state,
+            egress_tx,
+            egress_rx,
+            egress_sock_path: None,
         }
     }
 
@@ -139,6 +160,33 @@ impl SmoltcpNetwork {
     /// Must be called before VM boot. Requires a tokio runtime handle for
     /// spawning proxy tasks, DNS resolution, and published port listeners.
     pub fn start(&mut self, tokio_handle: tokio::runtime::Handle) {
+        // Spawn egress publisher if enabled.
+        let egress_handle = if let Some(egress_rx) = self.egress_rx.take() {
+            let client_connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+            if let Some(ref sock_path) = self.egress_sock_path {
+                publisher::spawn_publisher(
+                    &tokio_handle,
+                    sock_path,
+                    egress_rx,
+                    PublisherConfig {
+                        intercept_timeout_ms: self.config.egress_intercept_timeout_ms,
+                    },
+                    client_connected.clone(),
+                );
+            }
+
+            self.egress_tx.as_ref().map(|tx| EgressHandle {
+                tx: tx.clone(),
+                intercept_hosts: Arc::new(self.config.egress_intercept_hosts.clone()),
+                max_body_bytes: self.config.egress_max_body_bytes,
+                client_connected,
+                timeout_ms: self.config.egress_timeout_ms,
+            })
+        } else {
+            None
+        };
+
         let shared = self.shared.clone();
         let poll_config = PollLoopConfig {
             gateway_mac: self.gateway_mac,
@@ -167,10 +215,21 @@ impl SmoltcpNetwork {
                         published_ports,
                         max_connections,
                         tokio_handle,
+                        egress_handle,
                     );
                 })
                 .expect("failed to spawn smoltcp poll thread"),
         );
+    }
+
+    /// Set the egress socket path (called before `start()`).
+    pub fn set_egress_sock_path(&mut self, path: PathBuf) {
+        self.egress_sock_path = Some(path);
+    }
+
+    /// Get the egress socket path, if egress interception is enabled.
+    pub fn egress_sock_path(&self) -> Option<&PathBuf> {
+        self.egress_sock_path.as_ref()
     }
 
     /// Take the `NetBackend` for `VmBuilder::net()`. One-shot.

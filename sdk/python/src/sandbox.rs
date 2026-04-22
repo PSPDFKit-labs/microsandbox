@@ -5,6 +5,7 @@ use pyo3::types::PyDict;
 use tokio::sync::Mutex;
 
 use crate::config::resolve_config;
+use crate::egress::PyEgressConnection;
 use crate::error::to_py_err;
 use crate::exec::{PyExecHandle, PyExecOutput};
 use crate::fs::PySandboxFs;
@@ -452,6 +453,26 @@ impl PySandbox {
     }
 
     //----------------------------------------------------------------------------------------------
+    // Egress Interception
+    //----------------------------------------------------------------------------------------------
+
+    /// Connect to the egress interception socket.
+    ///
+    /// Returns a low-level `EgressConnection` with `recv()` and `send_decision()`
+    /// methods. Use the high-level `egress_intercept()` Python wrapper for
+    /// callback-style hooks.
+    fn egress_connection<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let sandbox = Self::clone_sandbox(&inner).await?;
+            let conn = sandbox.egress_connection().await.map_err(to_py_err)?;
+            Ok(PyEgressConnection {
+                inner: std::sync::Arc::new(tokio::sync::Mutex::new(conn)),
+            })
+        })
+    }
+
+    //----------------------------------------------------------------------------------------------
     // Context Manager
     //----------------------------------------------------------------------------------------------
 
@@ -501,6 +522,10 @@ struct ExecOpts {
     rlimits: Vec<(String, u64, u64)>,
     detach_keys: Option<String>,
 }
+
+//--------------------------------------------------------------------------------------------------
+// Helper Functions
+//--------------------------------------------------------------------------------------------------
 
 fn parse_exec_args(
     args_or_options: Option<&Bound<'_, PyAny>>,

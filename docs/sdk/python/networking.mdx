@@ -18,6 +18,10 @@ Network(
     tls: TlsConfig | None = None,
     max_connections: int | None = None,
     trust_host_cas: bool | None = None,
+    egress_intercept_hosts: Sequence[str] = (),
+    egress_max_body_bytes: int | None = None,
+    egress_intercept_timeout_ms: int | None = None,
+    egress_timeout_ms: int | None = None,
 )
 ```
 
@@ -29,6 +33,10 @@ Network(
 | tls | [`TlsConfig`](#tlsconfig) ` \| None` | `None` | TLS interception configuration |
 | max_connections | `int \| None` | `None` | Maximum concurrent connections |
 | trust_host_cas | `bool \| None` | `False` | Ship the host's trusted root CAs into the guest at boot so outbound TLS works behind corporate MITM proxies (Warp Zero Trust, Zscaler, etc.). Opt-in |
+| egress_intercept_hosts | `Sequence[str]` | `()` | Hosts to intercept. `"*"` for all. Supports exact match and `*.suffix` wildcards. Empty = no interception. See [Egress Interception](/networking/egress) |
+| egress_max_body_bytes | `int \| None` | `None` | Max body bytes captured per request/response (default: 64 MiB) |
+| egress_intercept_timeout_ms | `int \| None` | `None` | SDK decision timeout in milliseconds (default: 5000). Fail-open on timeout |
+| egress_timeout_ms | `int \| None` | `None` | Per-connection wall-clock timeout in milliseconds (default: 300000). Prevents SSE/streaming hangs. `0` to disable |
 
 ### DnsConfig
 
@@ -298,3 +306,66 @@ String enum for well-known destination groups used in [`Rule.destination`](#rule
 | `"link-local"` | Link-local addresses (`169.254.0.0/16`, `fe80::/10`) |
 | `"metadata"` | Cloud metadata endpoints (`169.254.169.254`) |
 | `"multicast"` | Multicast addresses (`224.0.0.0/4`, `ff00::/8`) |
+
+---
+
+## Egress Interception
+
+See [Egress Interception](/networking/egress) for conceptual overview.
+
+---
+
+#### egress_intercept()
+
+```python
+async def egress_intercept(
+    sandbox: Sandbox,
+    *,
+    on_request: Callable | None = None,
+    on_response: Callable | None = None,
+) -> None
+```
+
+Run egress interception with callback hooks. Blocks until the sandbox stops or the connection closes.
+
+**Parameters**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| sandbox | `Sandbox` | - | A running sandbox with `egress_intercept_hosts` configured |
+| on_request | `async (request, ctx) -> EgressHttpRequest \| EgressHttpResponse \| None` | `None` | Called for each outbound request. Return modified request, response (short-circuit), `None` (pass through), or raise to block |
+| on_response | `async (response, request, ctx) -> EgressHttpResponse \| None` | `None` | Called for each server response. Return modified response, `None` (pass through), or raise to block |
+
+---
+
+### EgressHttpRequest
+
+Mutable dataclass for intercepted HTTP requests.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| method | `str` | HTTP method |
+| uri | `str` | Request URI |
+| headers | `list[tuple[str, str]]` | Header name-value pairs |
+| body | `bytes \| None` | Request body (if captured) |
+
+### EgressHttpResponse
+
+Mutable dataclass for intercepted HTTP responses.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| status | `int` | HTTP status code |
+| headers | `list[tuple[str, str]]` | Header name-value pairs |
+| body | `bytes \| None` | Response body (if captured) |
+
+### EgressContext
+
+Frozen dataclass with connection metadata passed to hook callbacks.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| sni | `str` | TLS Server Name Indication |
+| dst | `str` | Destination address |
+| connection_id | `int` | Connection ID (shared between request and its response) |
+| timestamp_ms | `int` | Event timestamp (milliseconds since epoch) |

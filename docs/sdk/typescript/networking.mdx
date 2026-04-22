@@ -75,6 +75,10 @@ Network configuration object passed as [`SandboxConfig.network`](/sdk/typescript
 | rules? | `Array<`[`PolicyRule`](#policyrule)`>` | `[]` | Custom rules evaluated first-match-wins |
 | tls? | [`TlsConfig`](#tlsconfig) | - | TLS interception configuration |
 | trustHostCas? | `boolean` | `false` | Ship the host's trusted root CAs into the guest at boot so outbound TLS works behind corporate MITM proxies (Warp Zero Trust, Zscaler, etc.). Opt-in |
+| egressInterceptHosts? | `Array<string>` | `[]` | Hosts to intercept. `"*"` for all. Supports exact match and `*.suffix` wildcards. Empty = no interception. See [Egress Interception](/networking/egress) |
+| egressMaxBodyBytes? | `number` | `67108864` | Max body bytes captured per request/response (default: 64 MiB) |
+| egressInterceptTimeoutMs? | `number` | `5000` | SDK decision timeout in milliseconds. Fail-open on timeout |
+| egressTimeoutMs? | `number` | `300000` | Per-connection wall-clock timeout in milliseconds. Prevents SSE/streaming hangs. `0` to disable |
 
 ### DnsConfig
 
@@ -136,3 +140,66 @@ TLS interception settings within [`NetworkConfig`](#networkconfig).
 | interceptedPorts? | `Array<number>` | `[443]` | TCP ports where TLS interception is active |
 | upstreamCaCert? | `Array<string>` | `[]` | Paths to additional trusted CA PEM files for upstream verification |
 | verifyUpstream? | `boolean` | `true` | Verify upstream server certificates. Set to `false` only for self-signed servers. |
+
+---
+
+## Egress Interception
+
+See [Egress Interception](/networking/egress) for conceptual overview.
+
+---
+
+#### egressIntercept()
+
+```typescript
+async function egressIntercept(
+    sandbox: Sandbox,
+    options: EgressInterceptOptions
+): Promise<void>
+```
+
+Run egress interception with callback hooks. Blocks until the sandbox stops or the connection closes.
+
+**Parameters**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| sandbox | `Sandbox` | A running sandbox with `egressInterceptHosts` configured |
+| options | [`EgressInterceptOptions`](#egressinterceptoptions) | `onRequest` and/or `onResponse` hooks |
+
+---
+
+### EgressInterceptOptions
+
+| Field | Type | Description |
+|-------|------|-------------|
+| onRequest? | `(request, ctx) => EgressHttpRequest \| EgressHttpResponse \| undefined` | Called for each outbound request. Return modified request, response (short-circuit), `undefined` (pass through), or throw to block |
+| onResponse? | `(response, request, ctx) => EgressHttpResponse \| undefined` | Called for each server response. Return modified response, `undefined` (pass through), or throw to block |
+
+### EgressHttpRequest
+
+| Field | Type | Description |
+|-------|------|-------------|
+| method | `string` | HTTP method |
+| uri | `string` | Request URI |
+| headers | `Array<[string, string]>` | Header name-value pairs |
+| body? | `Buffer` | Request body (if captured) |
+
+### EgressHttpResponse
+
+| Field | Type | Description |
+|-------|------|-------------|
+| status | `number` | HTTP status code |
+| headers | `Array<[string, string]>` | Header name-value pairs |
+| body? | `Buffer` | Response body (if captured) |
+
+### EgressContext
+
+Connection metadata passed to hook callbacks.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| sni | `string` | TLS Server Name Indication |
+| dst | `string` | Destination address |
+| connectionId | `number` | Connection ID |
+| timestampMs | `number` | Event timestamp |

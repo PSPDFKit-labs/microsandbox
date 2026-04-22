@@ -553,6 +553,12 @@ fn build_vm(
         network_termination_handle = Some(network.termination_handle());
         network_metrics_handle = Some(network.metrics_handle());
 
+        // Set up egress interception socket if hosts are configured.
+        if !vm.network.egress_intercept_hosts.is_empty() {
+            let egress_sock = config.runtime_dir.join("egress.sock");
+            network.set_egress_sock_path(egress_sock);
+        }
+
         network.start(tokio_handle.clone());
 
         let guest_mac = network.guest_mac();

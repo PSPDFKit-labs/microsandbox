@@ -310,6 +310,10 @@ impl JsNetworkPolicy {
             tls: None,
             max_connections: None,
             trust_host_cas: None,
+            egress_intercept_hosts: None,
+            egress_max_body_bytes: None,
+            egress_intercept_timeout_ms: None,
+            egress_timeout_ms: None,
         }
     }
 
@@ -324,6 +328,10 @@ impl JsNetworkPolicy {
             tls: None,
             max_connections: None,
             trust_host_cas: None,
+            egress_intercept_hosts: None,
+            egress_max_body_bytes: None,
+            egress_intercept_timeout_ms: None,
+            egress_timeout_ms: None,
         }
     }
 
@@ -338,6 +346,10 @@ impl JsNetworkPolicy {
             tls: None,
             max_connections: None,
             trust_host_cas: None,
+            egress_intercept_hosts: None,
+            egress_max_body_bytes: None,
+            egress_intercept_timeout_ms: None,
+            egress_timeout_ms: None,
         }
     }
 }

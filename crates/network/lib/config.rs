@@ -8,9 +8,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use serde::{Deserialize, Serialize};
 
 use crate::dns::Nameserver;
-
 use crate::policy::NetworkPolicy;
-use crate::secrets::config::SecretsConfig;
+use crate::secrets::config::{HostPattern, SecretsConfig};
 use crate::tls::TlsConfig;
 
 //--------------------------------------------------------------------------------------------------
@@ -65,6 +64,29 @@ pub struct NetworkConfig {
     /// this is explicitly enabled. Default: false.
     #[serde(default)]
     pub trust_host_cas: bool,
+
+    /// Hosts to intercept for egress HTTP inspection. When non-empty, the TLS
+    /// proxy pauses on each request/response for matching hosts and waits for
+    /// a decision from the SDK client connected via `egress.sock`.
+    /// Supports exact match, `*.suffix` wildcards, and `*` for all hosts.
+    /// Empty = no interception.
+    #[serde(default)]
+    pub egress_intercept_hosts: Vec<HostPattern>,
+
+    /// Maximum body bytes to capture per request/response. Default: 64 MiB.
+    #[serde(default = "default_egress_max_body_bytes")]
+    pub egress_max_body_bytes: usize,
+
+    /// Timeout (ms) for the SDK to respond with a decision. Default: 5000.
+    /// On timeout the request is forwarded unchanged (fail-open).
+    #[serde(default = "default_egress_intercept_timeout_ms")]
+    pub egress_intercept_timeout_ms: u64,
+
+    /// Per-connection wall-clock timeout (ms) for intercepted connections.
+    /// Prevents SSE/streaming from hanging indefinitely. Default: 300000 (5 min).
+    /// Set to 0 to disable.
+    #[serde(default = "default_egress_timeout_ms")]
+    pub egress_timeout_ms: u64,
 }
 
 /// Optional overrides for the guest interface.
@@ -163,6 +185,10 @@ impl Default for NetworkConfig {
             secrets: SecretsConfig::default(),
             max_connections: None,
             trust_host_cas: false,
+            egress_intercept_hosts: Vec::new(),
+            egress_max_body_bytes: default_egress_max_body_bytes(),
+            egress_intercept_timeout_ms: default_egress_intercept_timeout_ms(),
+            egress_timeout_ms: default_egress_timeout_ms(),
         }
     }
 }
@@ -193,4 +219,16 @@ fn default_host_bind() -> IpAddr {
 
 fn default_query_timeout_ms() -> u64 {
     5000
+}
+
+fn default_egress_max_body_bytes() -> usize {
+    64 * 1024 * 1024 // 64 MiB
+}
+
+fn default_egress_intercept_timeout_ms() -> u64 {
+    5000
+}
+
+fn default_egress_timeout_ms() -> u64 {
+    300_000 // 5 minutes
 }

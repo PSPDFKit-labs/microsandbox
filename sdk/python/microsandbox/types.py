@@ -555,6 +555,10 @@ class Network:
     dns: DnsConfig | None = None
     tls: TlsConfig | None = None
     max_connections: int | None = None
+    egress_intercept_hosts: Sequence[str] = ()
+    egress_max_body_bytes: int | None = None
+    egress_intercept_timeout_ms: int | None = None
+    egress_timeout_ms: int | None = None
 
     @classmethod
     def none(cls) -> Network:
@@ -585,6 +589,14 @@ class Network:
             d["tls"] = self.tls._to_dict()
         if self.max_connections is not None:
             d["max_connections"] = self.max_connections
+        if self.egress_intercept_hosts:
+            d["egress_intercept_hosts"] = list(self.egress_intercept_hosts)
+        if self.egress_max_body_bytes is not None:
+            d["egress_max_body_bytes"] = self.egress_max_body_bytes
+        if self.egress_intercept_timeout_ms is not None:
+            d["egress_intercept_timeout_ms"] = self.egress_intercept_timeout_ms
+        if self.egress_timeout_ms is not None:
+            d["egress_timeout_ms"] = self.egress_timeout_ms
         return d
 
 #--------------------------------------------------------------------------------------------------

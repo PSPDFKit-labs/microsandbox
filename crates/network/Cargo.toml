@@ -12,7 +12,9 @@ path = "lib/lib.rs"
 
 [dependencies]
 bytes = { workspace = true }
+ciborium = { workspace = true }
 crossbeam-queue = { workspace = true }
+httparse = "1"
 dirs = { workspace = true }
 futures = { workspace = true }
 hickory-client = { workspace = true }
