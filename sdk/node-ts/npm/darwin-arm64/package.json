@@ -1,12 +1,10 @@
 {
   "name": "@superradcompany/microsandbox-darwin-arm64",
-  "version": "0.3.14",
+  "version": "0.0.0",
   "os": ["darwin"],
   "cpu": ["arm64"],
   "main": "microsandbox.darwin-arm64.node",
   "files": ["microsandbox.darwin-arm64.node"],
   "license": "Apache-2.0",
-  "engines": {
-    "node": ">= 18"
-  }
+  "description": "microsandbox native binding for macOS arm64"
 }

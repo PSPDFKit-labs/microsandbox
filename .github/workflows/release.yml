@@ -343,36 +343,65 @@ jobs:
           path: node-artifacts
           pattern: node-sdk-*
 
-      - name: Package Node SDK tarballs
+      - name: Package platform tarballs
         run: |
           mkdir -p node-release
-          # Copy tsc output (platform-independent, same across all builds)
-          cp -r node-artifacts/node-sdk-darwin-arm64/dist sdk/node-ts/
-          for dir in darwin-arm64 linux-x64-gnu linux-arm64-gnu; do
-            # Copy platform binary and generated JS into sdk/node-ts
-            cp node-artifacts/node-sdk-${dir}/microsandbox.*.node sdk/node-ts/
-            cp node-artifacts/node-sdk-${dir}/index.cjs sdk/node-ts/
-            cp node-artifacts/node-sdk-${dir}/index.d.cts sdk/node-ts/
+          VERSION="${{ inputs.version }}"
+          RELEASE_BASE="https://github.com/${{ github.repository }}/releases/download/v${VERSION}"
 
-            # Patch version and add .node binary to files list so npm pack includes it
+          # --- Platform packages (one per target) ---
+          # These contain only the native .node binary + a package.json with os/cpu
+          # fields. npm's optionalDependencies resolution will skip non-matching
+          # platforms automatically.
+          for dir in darwin-arm64 linux-x64-gnu linux-arm64-gnu; do
+            pkg_dir="sdk/node-ts/npm/${dir}"
+
+            # Patch version into platform package.json
             node -e "
               const fs = require('fs');
-              const pkg = JSON.parse(fs.readFileSync('sdk/node-ts/package.json', 'utf8'));
-              pkg.version = '${{ inputs.version }}';
-              pkg.files = [...pkg.files, '*.node'];
-              fs.writeFileSync('sdk/node-ts/package.json', JSON.stringify(pkg, null, 2));
+              const pkg = JSON.parse(fs.readFileSync('${pkg_dir}/package.json', 'utf8'));
+              pkg.version = '${VERSION}';
+              fs.writeFileSync('${pkg_dir}/package.json', JSON.stringify(pkg, null, 2));
             "
 
-            # npm pack creates a proper installable tarball
-            cd sdk/node-ts
-            npm pack
-            cd ../..
-            mv sdk/node-ts/microsandbox-*.tgz "node-release/microsandbox-node-sdk-${dir}.tgz"
+            # Copy the .node binary into the platform package
+            cp node-artifacts/node-sdk-${dir}/microsandbox.*.node "${pkg_dir}/"
 
-            # Restore package.json for next iteration
-            git checkout sdk/node-ts/package.json
-            rm -f sdk/node-ts/microsandbox.*.node
+            # Pack the platform package
+            npm pack --pack-destination node-release "${pkg_dir}"
+            # npm pack produces <scope>-<name>-<version>.tgz; rename to a
+            # predictable name so the main SDK can reference it.
+            mv "node-release/superradcompany-microsandbox-${dir}-${VERSION}.tgz" \
+               "node-release/microsandbox-native-${dir}.tgz"
+
+            # Clean up for next iteration
+            rm -f ${pkg_dir}/microsandbox.*.node
+            git checkout "${pkg_dir}/package.json"
           done
+
+          # --- Main SDK package (platform-independent, no .node files) ---
+          # Copy tsc output and generated JS (same across all builds)
+          cp -r node-artifacts/node-sdk-darwin-arm64/dist sdk/node-ts/
+          cp node-artifacts/node-sdk-darwin-arm64/index.cjs sdk/node-ts/
+          cp node-artifacts/node-sdk-darwin-arm64/index.d.cts sdk/node-ts/
+
+          # Patch version and optionalDependencies to point to platform tarballs
+          node -e "
+            const fs = require('fs');
+            const pkg = JSON.parse(fs.readFileSync('sdk/node-ts/package.json', 'utf8'));
+            pkg.version = '${VERSION}';
+            pkg.optionalDependencies = {
+              '@superradcompany/microsandbox-darwin-arm64': '${RELEASE_BASE}/microsandbox-native-darwin-arm64.tgz',
+              '@superradcompany/microsandbox-linux-x64-gnu': '${RELEASE_BASE}/microsandbox-native-linux-x64-gnu.tgz',
+              '@superradcompany/microsandbox-linux-arm64-gnu': '${RELEASE_BASE}/microsandbox-native-linux-arm64-gnu.tgz',
+            };
+            fs.writeFileSync('sdk/node-ts/package.json', JSON.stringify(pkg, null, 2));
+          "
+
+          npm pack --pack-destination node-release sdk/node-ts
+          mv "node-release/microsandbox-${VERSION}.tgz" "node-release/microsandbox-node-sdk.tgz"
+
+          git checkout sdk/node-ts/package.json
 
       - name: Upload to GitHub Release
         env:

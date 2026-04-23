@@ -50,11 +50,11 @@
 > ```
 > ```sh
 > # Python
-> pip install https://github.com/PSPDFKit-labs/microsandbox/releases/download/v0.3.14/microsandbox-0.3.14-linux_x86_64.whl
+> pip install microsandbox --find-links https://github.com/PSPDFKit-labs/microsandbox/releases/expanded_assets/v0.3.14
 > ```
 > ```sh
 > # TypeScript
-> npm install https://github.com/PSPDFKit-labs/microsandbox/releases/download/v0.3.14/microsandbox-node-sdk-linux-x64-gnu.tgz
+> npm install https://github.com/PSPDFKit-labs/microsandbox/releases/download/v0.3.14/microsandbox-node-sdk.tgz
 > ```
 
 #### <img height="14" src="https://octicons-col.vercel.app/download/A770EF">&nbsp;&nbsp;Install the CLI **(Optional)**
