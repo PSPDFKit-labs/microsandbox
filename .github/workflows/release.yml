@@ -368,7 +368,7 @@ jobs:
             cp node-artifacts/node-sdk-${dir}/microsandbox.*.node "${pkg_dir}/"
 
             # Pack the platform package
-            npm pack --pack-destination node-release "${pkg_dir}"
+            npm pack --pack-destination node-release "./${pkg_dir}"
             # npm pack produces <scope>-<name>-<version>.tgz; rename to a
             # predictable name so the main SDK can reference it.
             mv "node-release/superradcompany-microsandbox-${dir}-${VERSION}.tgz" \
@@ -398,7 +398,7 @@ jobs:
             fs.writeFileSync('sdk/node-ts/package.json', JSON.stringify(pkg, null, 2));
           "
 
-          npm pack --pack-destination node-release sdk/node-ts
+          npm pack --pack-destination node-release ./sdk/node-ts
           mv "node-release/microsandbox-${VERSION}.tgz" "node-release/microsandbox-node-sdk.tgz"
 
           git checkout sdk/node-ts/package.json
