@@ -51,6 +51,9 @@ enum FramerState {
         headers_end: usize,
         body_buf: Vec<u8>,
         chunk_state: ChunkState,
+        /// Number of chunk-encoded bytes already consumed by `process_chunks`.
+        /// Prevents re-processing old data when `feed()` is called multiple times.
+        chunk_bytes_consumed: usize,
     },
     /// Buffering a read-until-close body (no Content-Length, no chunked).
     /// Completes only via `feed_eof()`.
@@ -191,6 +194,7 @@ impl RequestFramer {
                                 chunk_state: ChunkState::ReadingSize {
                                     size_buf: Vec::new(),
                                 },
+                                chunk_bytes_consumed: 0,
                             };
                         }
                     }
@@ -263,17 +267,20 @@ impl RequestFramer {
                     headers_end,
                     body_buf,
                     chunk_state,
+                    chunk_bytes_consumed,
                 } => {
                     let headers_end_val = *headers_end;
                     let body_start = headers_end_val;
 
-                    // Process chunks from the current buffer position.
-                    let chunk_data = &self.buf[body_start..];
+                    // Only process NEW chunk data (skip already-consumed bytes).
+                    let chunk_data = &self.buf[body_start + *chunk_bytes_consumed..];
                     let result =
                         process_chunks(chunk_data, chunk_state, body_buf, self.max_body_bytes);
 
                     match result {
                         ChunkProcessResult::Incomplete => {
+                            // All bytes in this slice were consumed by process_chunks.
+                            *chunk_bytes_consumed = self.buf.len() - body_start;
                             return FrameResult::Incomplete;
                         }
                         ChunkProcessResult::TooLarge => {
@@ -315,7 +322,7 @@ impl RequestFramer {
                                 &headers_arr[..count],
                                 body,
                             );
-                            let consumed = body_start + bytes_consumed;
+                            let consumed = body_start + *chunk_bytes_consumed + bytes_consumed;
                             self.buf.drain(..consumed);
                             self.state = FramerState::AwaitingHeaders;
                             return FrameResult::Complete(request, consumed);
@@ -436,6 +443,7 @@ impl ResponseFramer {
                                 chunk_state: ChunkState::ReadingSize {
                                     size_buf: Vec::new(),
                                 },
+                                chunk_bytes_consumed: 0,
                             };
                         }
                     }
@@ -498,16 +506,19 @@ impl ResponseFramer {
                     headers_end,
                     body_buf,
                     chunk_state,
+                    chunk_bytes_consumed,
                 } => {
                     let headers_end_val = *headers_end;
                     let body_start = headers_end_val;
-                    let chunk_data = &self.buf[body_start..];
 
+                    // Only process NEW chunk data (skip already-consumed bytes).
+                    let chunk_data = &self.buf[body_start + *chunk_bytes_consumed..];
                     let result =
                         process_chunks(chunk_data, chunk_state, body_buf, self.max_body_bytes);
 
                     match result {
                         ChunkProcessResult::Incomplete => {
+                            *chunk_bytes_consumed = self.buf.len() - body_start;
                             return FrameResult::Incomplete;
                         }
                         ChunkProcessResult::TooLarge => {
@@ -541,7 +552,7 @@ impl ResponseFramer {
 
                             let response =
                                 build_response_from_parts(status, &headers_arr[..count], body);
-                            let consumed = body_start + bytes_consumed;
+                            let consumed = body_start + *chunk_bytes_consumed + bytes_consumed;
                             self.buf.drain(..consumed);
                             self.state = FramerState::AwaitingHeaders;
                             return FrameResult::Complete(response, consumed);
@@ -1270,5 +1281,113 @@ mod tests {
         let mut framer = ResponseFramer::new(1024);
         // No data fed — feed_eof should return Incomplete (nothing to emit).
         assert!(matches!(framer.feed_eof(), FrameResult::Incomplete));
+    }
+
+    // ── Multi-feed chunked tests ─────────────────────────────────────────
+
+    #[test]
+    fn response_chunked_multi_feed() {
+        // Chunked response arriving in multiple TCP segments.
+        let mut framer = ResponseFramer::new(1024);
+
+        // Feed 1: headers + partial chunk size
+        let part1 = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhel";
+        assert!(matches!(framer.feed(part1), FrameResult::Incomplete));
+
+        // Feed 2: rest of chunk data + terminal chunk
+        let part2 = b"lo\r\n0\r\n\r\n";
+        match framer.feed(part2) {
+            FrameResult::Complete(resp, _) => {
+                assert_eq!(resp.status, 200);
+                assert_eq!(resp.body.as_deref(), Some(b"hello".as_slice()));
+            }
+            other => panic!("expected Complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn response_chunked_multi_feed_multiple_chunks() {
+        // Two chunks, data split across three feeds.
+        let mut framer = ResponseFramer::new(1024);
+
+        // Feed 1: headers + first chunk
+        let part1 = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n";
+        assert!(matches!(framer.feed(part1), FrameResult::Incomplete));
+
+        // Feed 2: second chunk partially
+        let part2 = b"6\r\n wo";
+        assert!(matches!(framer.feed(part2), FrameResult::Incomplete));
+
+        // Feed 3: rest of second chunk + terminal
+        let part3 = b"rld\r\n0\r\n\r\n";
+        match framer.feed(part3) {
+            FrameResult::Complete(resp, _) => {
+                assert_eq!(resp.status, 200);
+                assert_eq!(resp.body.as_deref(), Some(b"hello world".as_slice()));
+            }
+            other => panic!("expected Complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn response_chunked_split_at_chunk_size_boundary() {
+        // Split exactly between chunk size line and chunk data.
+        let mut framer = ResponseFramer::new(1024);
+
+        let part1 = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\n";
+        assert!(matches!(framer.feed(part1), FrameResult::Incomplete));
+
+        let part2 = b"hello\r\n0\r\n\r\n";
+        match framer.feed(part2) {
+            FrameResult::Complete(resp, _) => {
+                assert_eq!(resp.body.as_deref(), Some(b"hello".as_slice()));
+            }
+            other => panic!("expected Complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn request_chunked_multi_feed() {
+        // Request-direction chunked also works across feeds.
+        let mut framer = RequestFramer::new(1024);
+
+        let part1 = b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhel";
+        assert!(matches!(framer.feed(part1), FrameResult::Incomplete));
+
+        let part2 = b"lo\r\n0\r\n\r\n";
+        match framer.feed(part2) {
+            FrameResult::Complete(req, _) => {
+                assert_eq!(req.method, "POST");
+                assert_eq!(req.body.as_deref(), Some(b"hello".as_slice()));
+            }
+            other => panic!("expected Complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn response_chunked_byte_at_a_time() {
+        // Worst case: feed one byte at a time.
+        let mut framer = ResponseFramer::new(1024);
+        let full = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+
+        for (i, &byte) in full.iter().enumerate() {
+            match framer.feed(&[byte]) {
+                FrameResult::Incomplete => {}
+                FrameResult::Complete(resp, _) => {
+                    // Completes once the terminal chunk "0\r\n" is seen and
+                    // the trailing \r\n is consumed (if available).
+                    assert_eq!(resp.body.as_deref(), Some(b"hello".as_slice()));
+                    // Verify we're near the end (within last few bytes).
+                    assert!(
+                        i >= full.len() - 3,
+                        "completed too early at byte {i}/{}",
+                        full.len()
+                    );
+                    return;
+                }
+                other => panic!("unexpected result at byte {i}: {other:?}"),
+            }
+        }
+        panic!("never completed");
     }
 }

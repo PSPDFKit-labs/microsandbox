@@ -559,7 +559,13 @@ fn build_vm(
             network.set_egress_sock_path(egress_sock);
         }
 
-        network.start(tokio_handle.clone());
+        let egress_ready = network.start(tokio_handle.clone());
+
+        // Wait for the egress publisher to bind its socket before proceeding.
+        // This ensures the socket exists by the time Sandbox::create() returns to the SDK.
+        if let Some(rx) = egress_ready {
+            let _ = tokio_handle.block_on(rx);
+        }
 
         let guest_mac = network.guest_mac();
         let net_backend = network.take_backend();

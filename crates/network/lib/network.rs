@@ -159,12 +159,18 @@ impl SmoltcpNetwork {
     ///
     /// Must be called before VM boot. Requires a tokio runtime handle for
     /// spawning proxy tasks, DNS resolution, and published port listeners.
-    pub fn start(&mut self, tokio_handle: tokio::runtime::Handle) {
+    pub fn start(
+        &mut self,
+        tokio_handle: tokio::runtime::Handle,
+    ) -> Option<tokio::sync::oneshot::Receiver<()>> {
         // Spawn egress publisher if enabled.
+        let mut egress_ready_rx = None;
         let egress_handle = if let Some(egress_rx) = self.egress_rx.take() {
             let client_connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
             if let Some(ref sock_path) = self.egress_sock_path {
+                let (bind_tx, bind_rx) = tokio::sync::oneshot::channel();
+                egress_ready_rx = Some(bind_rx);
                 publisher::spawn_publisher(
                     &tokio_handle,
                     sock_path,
@@ -173,6 +179,7 @@ impl SmoltcpNetwork {
                         intercept_timeout_ms: self.config.egress_intercept_timeout_ms,
                     },
                     client_connected.clone(),
+                    bind_tx,
                 );
             }
 
@@ -220,6 +227,8 @@ impl SmoltcpNetwork {
                 })
                 .expect("failed to spawn smoltcp poll thread"),
         );
+
+        egress_ready_rx
     }
 
     /// Set the egress socket path (called before `start()`).

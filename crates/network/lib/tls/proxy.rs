@@ -239,8 +239,12 @@ async fn intercept_relay(
         .await
         .map_err(io::Error::other)?;
 
-    // Egress interception framers (created only when egress is active and
-    // an SDK client is connected — no point buffering if nobody is listening).
+    // Egress interception framers — created only when an SDK client is connected.
+    // The BodyTooLarge framer behavior rejects oversize responses with 502, so
+    // framers must only be active when the SDK client is listening. Infrastructure
+    // traffic (npm install, apt-get) runs before the SDK connects and passes through
+    // unintercepted. The agentic-usability SDK calls createEgressLogger() after
+    // install, just before the agent runs, so all agent connections get framers.
     let connection_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
     let mut req_framer = egress
         .as_ref()
@@ -457,7 +461,13 @@ async fn intercept_relay(
                                     ResponseFrameResult::BodyTooLarge => {
                                         // Discard held-back bytes, reject with 502.
                                         resp_held_back.clear();
-                                        tracing::debug!(sni = sni_name, "egress: response body too large, rejecting with 502");
+                                        let max = egress.as_ref().map_or(0, |e| e.max_body_bytes);
+                                        tracing::warn!(
+                                            sni = sni_name,
+                                            max_body_bytes = max,
+                                            "egress: response body exceeds max_body_bytes ({max} bytes), rejecting with 502. \
+                                             Increase egress_max_body_bytes or remove this host from egress_intercept_hosts."
+                                        );
                                         let error_resp = serialize::serialize_response(
                                             &HttpResponse {
                                                 status: 502,
@@ -476,6 +486,34 @@ async fn intercept_relay(
                                         return Err(io::Error::new(
                                             io::ErrorKind::InvalidData,
                                             "egress: response body exceeds max size",
+                                        ));
+                                    }
+                                    ResponseFrameResult::ParseError => {
+                                        // Malformed chunked encoding — reject with 502.
+                                        resp_held_back.clear();
+                                        tracing::warn!(
+                                            sni = sni_name,
+                                            "egress: malformed chunked encoding in response, rejecting with 502. \
+                                             Consider removing this host from egress_intercept_hosts if the server uses non-standard encoding."
+                                        );
+                                        let error_resp = serialize::serialize_response(
+                                            &HttpResponse {
+                                                status: 502,
+                                                headers: vec![
+                                                    ("Content-Type".into(), "text/plain".into()),
+                                                    ("Connection".into(), "close".into()),
+                                                ],
+                                                body: Some(b"502 Bad Gateway\n".to_vec()),
+                                            },
+                                        );
+                                        guest_tls
+                                            .writer()
+                                            .write_all(&error_resp)
+                                            .map_err(io::Error::other)?;
+                                        flush_to_guest(&mut guest_tls, &to_smoltcp, &shared, &mut tls_buf).await?;
+                                        return Err(io::Error::new(
+                                            io::ErrorKind::InvalidData,
+                                            "egress: malformed chunked encoding in response",
                                         ));
                                     }
                                     ResponseFrameResult::Incomplete => {
@@ -632,6 +670,8 @@ enum ResponseFrameResult {
     Incomplete,
     /// Response body exceeds max — reject with 502.
     BodyTooLarge,
+    /// Malformed chunked encoding — reject with 502.
+    ParseError,
     /// Protocol upgrade (101 Switching Protocols). Contains the hook action
     /// for the headers-only response.
     Upgrade(EgressAction),
@@ -672,7 +712,7 @@ async fn feed_response_framer(
         }
         FrameResult::Incomplete => ResponseFrameResult::Incomplete,
         FrameResult::BodyTooLarge => ResponseFrameResult::BodyTooLarge,
-        FrameResult::ParseError => ResponseFrameResult::BodyTooLarge, // treat as rejection
+        FrameResult::ParseError => ResponseFrameResult::ParseError,
     }
 }
 
@@ -824,7 +864,13 @@ async fn forward_plaintext_with_egress(
                 FrameResult::BodyTooLarge => {
                     // Discard held-back, reject with 413.
                     req_held_back.clear();
-                    tracing::debug!(sni, "egress: request body too large, rejecting with 413");
+                    let max = egress.as_ref().map_or(0, |e| e.max_body_bytes);
+                    tracing::warn!(
+                        sni,
+                        max_body_bytes = max,
+                        "egress: request body exceeds max_body_bytes ({max} bytes), rejecting with 413. \
+                         Increase egress_max_body_bytes or remove this host from egress_intercept_hosts."
+                    );
                     let error_resp = serialize::serialize_response(&HttpResponse {
                         status: 413,
                         headers: vec![
@@ -846,7 +892,11 @@ async fn forward_plaintext_with_egress(
                 FrameResult::ParseError => {
                     // Malformed chunked encoding — reject with 400.
                     req_held_back.clear();
-                    tracing::debug!(sni, "egress: malformed chunked request, rejecting with 400");
+                    tracing::warn!(
+                        sni,
+                        "egress: malformed chunked encoding in request, rejecting with 400. \
+                         Consider removing this host from egress_intercept_hosts if the guest uses non-standard encoding."
+                    );
                     let error_resp = serialize::serialize_response(&HttpResponse {
                         status: 400,
                         headers: vec![

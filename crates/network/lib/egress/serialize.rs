@@ -30,6 +30,9 @@ pub fn serialize_request(req: &HttpRequest) -> Vec<u8> {
             buf.extend_from_slice(body.len().to_string().as_bytes());
             buf.extend_from_slice(b"\r\n");
             wrote_content_length = true;
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            // Drop Transfer-Encoding — we re-serialize with Content-Length.
+            continue;
         } else {
             buf.extend_from_slice(name.as_bytes());
             buf.extend_from_slice(b": ");
@@ -76,6 +79,9 @@ pub fn serialize_response(resp: &HttpResponse) -> Vec<u8> {
             buf.extend_from_slice(body.len().to_string().as_bytes());
             buf.extend_from_slice(b"\r\n");
             wrote_content_length = true;
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            // Drop Transfer-Encoding — we re-serialize with Content-Length.
+            continue;
         } else {
             buf.extend_from_slice(name.as_bytes());
             buf.extend_from_slice(b": ");
@@ -216,6 +222,41 @@ mod tests {
         let s = String::from_utf8(bytes).unwrap();
         assert!(s.contains("Content-Length: 0\r\n"));
         assert!(s.ends_with("\r\n\r\n"));
+    }
+
+    #[test]
+    fn serialize_request_strips_transfer_encoding() {
+        let req = HttpRequest {
+            method: "POST".into(),
+            uri: "/data".into(),
+            headers: vec![
+                ("Host".into(), "example.com".into()),
+                ("Transfer-Encoding".into(), "chunked".into()),
+            ],
+            body: Some(b"hello".to_vec()),
+        };
+        let bytes = serialize_request(&req);
+        let s = String::from_utf8(bytes).unwrap();
+        assert!(s.contains("Content-Length: 5\r\n"));
+        assert!(!s.to_lowercase().contains("transfer-encoding"));
+        assert!(s.ends_with("hello"));
+    }
+
+    #[test]
+    fn serialize_response_strips_transfer_encoding() {
+        let resp = HttpResponse {
+            status: 200,
+            headers: vec![
+                ("Content-Type".into(), "text/plain".into()),
+                ("Transfer-Encoding".into(), "chunked".into()),
+            ],
+            body: Some(b"world".to_vec()),
+        };
+        let bytes = serialize_response(&resp);
+        let s = String::from_utf8(bytes).unwrap();
+        assert!(s.contains("Content-Length: 5\r\n"));
+        assert!(!s.to_lowercase().contains("transfer-encoding"));
+        assert!(s.ends_with("world"));
     }
 
     #[test]

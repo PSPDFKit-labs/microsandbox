@@ -69,11 +69,18 @@ pub fn spawn_publisher(
     event_rx: mpsc::Receiver<ProxyMessage>,
     config: PublisherConfig,
     client_connected: Arc<AtomicBool>,
+    bind_ready_tx: oneshot::Sender<()>,
 ) {
     let socket_path = socket_path.to_path_buf();
     handle.spawn(async move {
-        if let Err(e) =
-            publisher_task(socket_path.as_ref(), event_rx, config, client_connected).await
+        if let Err(e) = publisher_task(
+            socket_path.as_ref(),
+            event_rx,
+            config,
+            client_connected,
+            bind_ready_tx,
+        )
+        .await
         {
             tracing::debug!(error = %e, "egress publisher ended");
         }
@@ -93,6 +100,7 @@ async fn publisher_task(
     mut event_rx: mpsc::Receiver<ProxyMessage>,
     config: PublisherConfig,
     client_connected: Arc<AtomicBool>,
+    bind_ready_tx: oneshot::Sender<()>,
 ) -> io::Result<()> {
     // Remove stale socket if it exists.
     let _ = std::fs::remove_file(socket_path);
@@ -103,6 +111,10 @@ async fn publisher_task(
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600));
     }
+
+    // Signal that the socket is bound and ready for SDK connections.
+    let _ = bind_ready_tx.send(());
+
     tracing::debug!(path = %socket_path.display(), "egress publisher listening");
 
     let mut client: Option<UnixStream> = None;
@@ -164,46 +176,71 @@ async fn publisher_task(
                     // Store pending decision.
                     pending.insert(event_id, reply);
 
-                    // Try to read a decision from the SDK client.
-                    let timeout = time::Duration::from_millis(config.intercept_timeout_ms);
-                    match time::timeout(timeout, read_frame(stream)).await {
-                        Ok(Ok(frame_data)) => {
-                            match cbor_decode::<EgressDecision>(&frame_data) {
-                                Ok(decision) => {
-                                    if let Some(reply) = pending.remove(&decision.id) {
-                                        let _ = reply.send(decision);
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::debug!(error = %e, "egress: CBOR decode decision failed");
-                                    if let Some(reply) = pending.remove(&event_id) {
-                                        let _ = reply.send(EgressDecision {
-                                            id: event_id,
-                                            action: EgressAction::PassThrough,
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                        Ok(Err(e)) => {
-                            tracing::debug!(error = %e, "egress: read from SDK client failed");
-                            client = None;
-                            client_connected.store(false, Ordering::Relaxed);
-                            if let Some(reply) = pending.remove(&event_id) {
-                                let _ = reply.send(EgressDecision {
-                                    id: event_id,
-                                    action: EgressAction::PassThrough,
-                                });
-                            }
-                        }
-                        Err(_) => {
-                            // Timeout — fail-open.
+                    // Read decisions from the SDK client until we get one for the
+                    // current event, timeout, or hit an error. This drains any
+                    // stale decisions from prior timed-out events so they don't
+                    // cascade and cause every subsequent event to also timeout.
+                    let deadline = time::Instant::now()
+                        + time::Duration::from_millis(config.intercept_timeout_ms);
+                    loop {
+                        let remaining = deadline.saturating_duration_since(time::Instant::now());
+                        if remaining.is_zero() {
                             tracing::debug!(event_id, "egress: SDK decision timeout, passing through");
                             if let Some(reply) = pending.remove(&event_id) {
                                 let _ = reply.send(EgressDecision {
                                     id: event_id,
                                     action: EgressAction::PassThrough,
                                 });
+                            }
+                            break;
+                        }
+
+                        match time::timeout(remaining, read_frame(stream)).await {
+                            Ok(Ok(frame_data)) => {
+                                match cbor_decode::<EgressDecision>(&frame_data) {
+                                    Ok(decision) => {
+                                        let is_current = decision.id == event_id;
+                                        if let Some(reply) = pending.remove(&decision.id) {
+                                            let _ = reply.send(decision);
+                                        }
+                                        if is_current {
+                                            break;
+                                        }
+                                        // Stale decision — loop to read the next one.
+                                    }
+                                    Err(e) => {
+                                        tracing::debug!(error = %e, "egress: CBOR decode decision failed");
+                                        if let Some(reply) = pending.remove(&event_id) {
+                                            let _ = reply.send(EgressDecision {
+                                                id: event_id,
+                                                action: EgressAction::PassThrough,
+                                            });
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                            Ok(Err(e)) => {
+                                tracing::debug!(error = %e, "egress: read from SDK client failed");
+                                client = None;
+                                client_connected.store(false, Ordering::Relaxed);
+                                if let Some(reply) = pending.remove(&event_id) {
+                                    let _ = reply.send(EgressDecision {
+                                        id: event_id,
+                                        action: EgressAction::PassThrough,
+                                    });
+                                }
+                                break;
+                            }
+                            Err(_) => {
+                                tracing::debug!(event_id, "egress: SDK decision timeout, passing through");
+                                if let Some(reply) = pending.remove(&event_id) {
+                                    let _ = reply.send(EgressDecision {
+                                        id: event_id,
+                                        action: EgressAction::PassThrough,
+                                    });
+                                }
+                                break;
                             }
                         }
                     }
@@ -307,10 +344,16 @@ mod tests {
         };
 
         let handle = tokio::runtime::Handle::current();
-        spawn_publisher(&handle, &sock, rx, config, Arc::new(AtomicBool::new(false)));
-
-        // Wait for listener to bind.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let (bind_tx, bind_rx) = oneshot::channel();
+        spawn_publisher(
+            &handle,
+            &sock,
+            rx,
+            config,
+            Arc::new(AtomicBool::new(false)),
+            bind_tx,
+        );
+        bind_rx.await.unwrap();
 
         // Send event with no client connected.
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -336,8 +379,16 @@ mod tests {
         };
 
         let handle = tokio::runtime::Handle::current();
-        spawn_publisher(&handle, &sock, rx, config, Arc::new(AtomicBool::new(false)));
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let (bind_tx, bind_rx) = oneshot::channel();
+        spawn_publisher(
+            &handle,
+            &sock,
+            rx,
+            config,
+            Arc::new(AtomicBool::new(false)),
+            bind_tx,
+        );
+        bind_rx.await.unwrap();
 
         // Connect as SDK client.
         let mut client = tokio::net::UnixStream::connect(&sock).await.unwrap();
@@ -393,8 +444,16 @@ mod tests {
         };
 
         let handle = tokio::runtime::Handle::current();
-        spawn_publisher(&handle, &sock, rx, config, Arc::new(AtomicBool::new(false)));
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let (bind_tx, bind_rx) = oneshot::channel();
+        spawn_publisher(
+            &handle,
+            &sock,
+            rx,
+            config,
+            Arc::new(AtomicBool::new(false)),
+            bind_tx,
+        );
+        bind_rx.await.unwrap();
 
         // Connect as SDK client but never reply.
         let _client = tokio::net::UnixStream::connect(&sock).await.unwrap();
@@ -428,8 +487,16 @@ mod tests {
         };
 
         let handle = tokio::runtime::Handle::current();
-        spawn_publisher(&handle, &sock, rx, config, Arc::new(AtomicBool::new(false)));
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let (bind_tx, bind_rx) = oneshot::channel();
+        spawn_publisher(
+            &handle,
+            &sock,
+            rx,
+            config,
+            Arc::new(AtomicBool::new(false)),
+            bind_tx,
+        );
+        bind_rx.await.unwrap();
 
         // Connect and immediately disconnect.
         {
@@ -465,8 +532,16 @@ mod tests {
         };
 
         let handle = tokio::runtime::Handle::current();
-        spawn_publisher(&handle, &sock, rx, config, Arc::new(AtomicBool::new(false)));
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let (bind_tx, bind_rx) = oneshot::channel();
+        spawn_publisher(
+            &handle,
+            &sock,
+            rx,
+            config,
+            Arc::new(AtomicBool::new(false)),
+            bind_tx,
+        );
+        bind_rx.await.unwrap();
 
         let mut client = tokio::net::UnixStream::connect(&sock).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
