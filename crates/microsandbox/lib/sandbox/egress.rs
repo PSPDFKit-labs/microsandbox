@@ -6,6 +6,8 @@
 
 use std::io;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -23,6 +25,16 @@ use microsandbox_network::egress::event::{
 /// writing decisions.
 pub struct EgressConnection {
     stream: UnixStream,
+}
+
+/// Handle for a running egress interception loop.
+///
+/// Returned by [`EgressConnection::intercept`]. The event loop runs in a
+/// background Tokio task. Use [`stop`](Self::stop) to signal graceful
+/// shutdown, and [`wait`](Self::wait) to await completion.
+pub struct EgressInterceptHandle {
+    stop_flag: Arc<AtomicBool>,
+    join: tokio::task::JoinHandle<io::Result<()>>,
 }
 
 /// Result type for egress request hooks.
@@ -74,8 +86,10 @@ impl EgressConnection {
 
     /// Run the interception event loop with user-provided hooks.
     ///
-    /// Calls `on_request` for each outbound request and `on_response` for each
-    /// server response. The hooks' return values determine the action:
+    /// Spawns a background Tokio task that reads events and calls the hooks.
+    /// Returns an [`EgressInterceptHandle`] immediately — use
+    /// [`handle.stop()`](EgressInterceptHandle::stop) to signal shutdown and
+    /// [`handle.wait()`](EgressInterceptHandle::wait) to await completion.
     ///
     /// **`on_request`**: receives `(&mut HttpRequest, &EgressContext)`:
     /// - Returns `Ok(None)` → pass through unchanged
@@ -87,75 +101,102 @@ impl EgressConnection {
     /// - Returns `Ok(None)` → pass through unchanged
     /// - Returns `Ok(Some(resp))` → forward modified response
     /// - Returns `Err(_)` → block the connection
-    pub async fn intercept<F, G>(&mut self, mut on_request: F, mut on_response: G) -> io::Result<()>
+    pub fn intercept<F, G>(self, mut on_request: F, mut on_response: G) -> EgressInterceptHandle
     where
         F: FnMut(
-            &mut HttpRequest,
-            &EgressContext,
-        ) -> Result<Option<RequestAction>, Box<dyn std::error::Error>>,
+                &mut HttpRequest,
+                &EgressContext,
+            ) -> Result<Option<RequestAction>, Box<dyn std::error::Error>>
+            + Send
+            + 'static,
         G: FnMut(
-            &mut HttpResponse,
-            &HttpRequest,
-            &EgressContext,
-        ) -> Result<ResponseAction, Box<dyn std::error::Error>>,
+                &mut HttpResponse,
+                &HttpRequest,
+                &EgressContext,
+            ) -> Result<ResponseAction, Box<dyn std::error::Error>>
+            + Send
+            + 'static,
     {
-        // Track the last request per connection for pairing with responses.
-        let mut last_requests: std::collections::HashMap<u64, HttpRequest> =
-            std::collections::HashMap::new();
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let stop = stop_flag.clone();
 
-        loop {
-            let event = match self.recv().await? {
-                Some(e) => e,
-                None => break,
-            };
+        let join = tokio::spawn(async move {
+            let mut conn = self;
+            let mut last_requests: std::collections::HashMap<u64, HttpRequest> =
+                std::collections::HashMap::new();
 
-            let ctx = EgressContext::from(&event);
-            let event_id = event.id;
-            let conn_id = event.connection_id;
-
-            let action = match event.kind {
-                EgressEventKind::Request(mut req) => match on_request(&mut req, &ctx) {
-                    Ok(None) => {
-                        last_requests.insert(conn_id, req);
-                        EgressAction::PassThrough
-                    }
-                    Ok(Some(RequestAction::Forward(modified))) => {
-                        last_requests.insert(conn_id, modified.clone());
-                        EgressAction::ModifyRequest(modified)
-                    }
-                    Ok(Some(RequestAction::ShortCircuit(resp))) => {
-                        last_requests.insert(conn_id, req);
-                        EgressAction::ShortCircuit(resp)
-                    }
-                    Err(_) => EgressAction::Block,
-                },
-                EgressEventKind::Response(mut resp) => {
-                    let empty_req = HttpRequest {
-                        method: String::new(),
-                        uri: String::new(),
-                        headers: Vec::new(),
-                        body: None,
-                    };
-                    let req = last_requests.get(&conn_id).unwrap_or(&empty_req);
-
-                    let result = match on_response(&mut resp, req, &ctx) {
-                        Ok(None) => EgressAction::PassThrough,
-                        Ok(Some(modified)) => EgressAction::ModifyResponse(modified),
-                        Err(_) => EgressAction::Block,
-                    };
-                    last_requests.remove(&conn_id);
-                    result
+            loop {
+                if stop.load(Ordering::Relaxed) {
+                    break;
                 }
-            };
 
-            self.send_decision(EgressDecision {
-                id: event_id,
-                action,
-            })
-            .await?;
-        }
+                let event = match conn.recv().await? {
+                    Some(e) => e,
+                    None => break,
+                };
 
-        Ok(())
+                let ctx = EgressContext::from(&event);
+                let event_id = event.id;
+                let conn_id = event.connection_id;
+
+                let action = match event.kind {
+                    EgressEventKind::Request(mut req) => match on_request(&mut req, &ctx) {
+                        Ok(None) => {
+                            last_requests.insert(conn_id, req);
+                            EgressAction::PassThrough
+                        }
+                        Ok(Some(RequestAction::Forward(modified))) => {
+                            last_requests.insert(conn_id, modified.clone());
+                            EgressAction::ModifyRequest(modified)
+                        }
+                        Ok(Some(RequestAction::ShortCircuit(resp))) => {
+                            last_requests.insert(conn_id, req);
+                            EgressAction::ShortCircuit(resp)
+                        }
+                        Err(_) => EgressAction::Block,
+                    },
+                    EgressEventKind::Response(mut resp) => {
+                        let empty_req = HttpRequest {
+                            method: String::new(),
+                            uri: String::new(),
+                            headers: Vec::new(),
+                            body: None,
+                        };
+                        let req = last_requests.get(&conn_id).unwrap_or(&empty_req);
+
+                        let result = match on_response(&mut resp, req, &ctx) {
+                            Ok(None) => EgressAction::PassThrough,
+                            Ok(Some(modified)) => EgressAction::ModifyResponse(modified),
+                            Err(_) => EgressAction::Block,
+                        };
+                        last_requests.remove(&conn_id);
+                        result
+                    }
+                };
+
+                conn.send_decision(EgressDecision {
+                    id: event_id,
+                    action,
+                })
+                .await?;
+            }
+
+            Ok(())
+        });
+
+        EgressInterceptHandle { stop_flag, join }
+    }
+}
+
+impl EgressInterceptHandle {
+    /// Signal the event loop to stop after the current event.
+    pub fn stop(&self) {
+        self.stop_flag.store(true, Ordering::Relaxed);
+    }
+
+    /// Wait for the event loop to finish and return its result.
+    pub async fn wait(self) -> io::Result<()> {
+        self.join.await.map_err(io::Error::other)?
     }
 }
 
@@ -342,13 +383,12 @@ mod tests {
             decision
         });
 
-        let mut conn = EgressConnection::connect(&sock_clone).await.unwrap();
-        conn.intercept(
+        let conn = EgressConnection::connect(&sock_clone).await.unwrap();
+        let handle = conn.intercept(
             |_req, _ctx| Ok(None), // pass through
             |_resp, _req, _ctx| Ok(None),
-        )
-        .await
-        .unwrap();
+        );
+        handle.wait().await.unwrap();
 
         let decision = server.await.unwrap();
         assert_eq!(decision.id, 1);
@@ -371,16 +411,15 @@ mod tests {
             decision
         });
 
-        let mut conn = EgressConnection::connect(&sock_clone).await.unwrap();
-        conn.intercept(
+        let conn = EgressConnection::connect(&sock_clone).await.unwrap();
+        let handle = conn.intercept(
             |req, _ctx| {
                 req.headers.push(("X-Trace".into(), "abc".into()));
                 Ok(Some(RequestAction::Forward(req.clone())))
             },
             |_resp, _req, _ctx| Ok(None),
-        )
-        .await
-        .unwrap();
+        );
+        handle.wait().await.unwrap();
 
         let decision = server.await.unwrap();
         assert_eq!(decision.id, 1);
@@ -412,8 +451,8 @@ mod tests {
             decision
         });
 
-        let mut conn = EgressConnection::connect(&sock_clone).await.unwrap();
-        conn.intercept(
+        let conn = EgressConnection::connect(&sock_clone).await.unwrap();
+        let handle = conn.intercept(
             |_req, _ctx| {
                 Ok(Some(RequestAction::ShortCircuit(HttpResponse {
                     status: 403,
@@ -422,9 +461,8 @@ mod tests {
                 })))
             },
             |_resp, _req, _ctx| Ok(None),
-        )
-        .await
-        .unwrap();
+        );
+        handle.wait().await.unwrap();
 
         let decision = server.await.unwrap();
         match decision.action {
@@ -452,13 +490,12 @@ mod tests {
             decision
         });
 
-        let mut conn = EgressConnection::connect(&sock_clone).await.unwrap();
-        conn.intercept(
+        let conn = EgressConnection::connect(&sock_clone).await.unwrap();
+        let handle = conn.intercept(
             |_req, _ctx| Err("blocked!".into()),
             |_resp, _req, _ctx| Ok(None),
-        )
-        .await
-        .unwrap();
+        );
+        handle.wait().await.unwrap();
 
         let decision = server.await.unwrap();
         assert_eq!(decision.id, 1);
@@ -484,21 +521,20 @@ mod tests {
             d2
         });
 
-        let mut conn = EgressConnection::connect(&sock_clone).await.unwrap();
+        let conn = EgressConnection::connect(&sock_clone).await.unwrap();
 
         let seen_request_uri = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let uri_clone = seen_request_uri.clone();
 
-        conn.intercept(
+        let handle = conn.intercept(
             |_req, _ctx| Ok(None), // pass through request
             move |_resp, req, _ctx| {
                 // The response hook should receive the original request.
                 *uri_clone.lock().unwrap() = req.uri.clone();
                 Ok(None)
             },
-        )
-        .await
-        .unwrap();
+        );
+        handle.wait().await.unwrap();
 
         let decision = server.await.unwrap();
         assert_eq!(decision.action, EgressAction::PassThrough);

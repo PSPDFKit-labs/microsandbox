@@ -848,3 +848,77 @@ const sandbox = await Sandbox.create({
   maxDurationSecs: 3600,
 });
 ```
+
+---
+
+## Egress Interception
+
+Intercept and inspect/modify all outbound HTTP traffic from the sandbox.
+
+```typescript
+import { Sandbox } from "microsandbox";
+import { egressIntercept } from "microsandbox/egress-intercept";
+
+const sandbox = await Sandbox.create({
+  name: "egress-demo",
+  image: "node",
+  network: {
+    egressInterceptHosts: ["*"],
+  },
+});
+
+// Start interception — returns a handle immediately
+const intercept = await egressIntercept(sandbox, {
+  onRequest: async (request, ctx) => {
+    console.log(`-> ${request.method} ${request.uri} [${ctx.sni}]`);
+    // Add a header to every outbound request
+    request.headers.push(["X-Trace-Id", "abc123"]);
+    return request; // forward modified
+  },
+  onResponse: async (response, request, ctx) => {
+    console.log(`<- ${response.status} [${ctx.sni}]`);
+    return undefined; // pass through unchanged
+  },
+});
+
+// Run commands while interception is active
+const result = await sandbox.exec("node", [
+  "-e",
+  "const r = await fetch('https://example.com'); console.log(r.status);",
+]);
+console.log(result.stdout);
+
+// Clean up
+await intercept.stop();
+await sandbox.stopAndWait();
+```
+
+### Blocking a request
+
+Throw from a hook to block the connection:
+
+```typescript
+const intercept = await egressIntercept(sandbox, {
+  onRequest: async (request, ctx) => {
+    if (request.uri.includes("/admin")) {
+      throw new Error("blocked");
+    }
+    return undefined; // pass through
+  },
+});
+```
+
+### Short-circuiting a response
+
+Return a response object from `onRequest` to skip the server entirely:
+
+```typescript
+const intercept = await egressIntercept(sandbox, {
+  onRequest: async (request, ctx) => {
+    if (ctx.sni === "blocked.example.com") {
+      return { status: 403, headers: [], body: Buffer.from("Forbidden") };
+    }
+    return undefined;
+  },
+});
+```

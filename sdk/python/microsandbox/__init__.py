@@ -34,7 +34,7 @@ from microsandbox._microsandbox import (
     is_installed,
     version,
 )
-from microsandbox.egress_intercept import egress_intercept
+from microsandbox.egress_intercept import EgressInterceptHandle, egress_intercept
 from microsandbox.errors import (
     ExecFailedError,
     ExecTimeoutError,
@@ -177,6 +177,7 @@ __all__ = [
     "EgressHttpRequest",
     "EgressHttpResponse",
     "EgressContext",
+    "EgressInterceptHandle",
     "egress_intercept",
     # Images / rootfs
     "Image",

@@ -23,8 +23,8 @@ let sb = Sandbox::builder("agent")
     .build_and_start()
     .await?;
 
-let mut conn = sb.egress_connection().await?;
-conn.intercept(
+let conn = sb.egress_connection().await?;
+let handle = conn.intercept(
     |req, ctx| {
         println!("→ {} {} [{}]", req.method, req.uri, ctx.sni);
         req.headers.push(("X-Trace-Id".into(), "abc123".into()));
@@ -34,8 +34,10 @@ conn.intercept(
         println!("← {} [{}]", resp.status, ctx.sni);
         Ok(None) // pass through
     },
-)
-.await?;
+);
+// ... do other work while interception is active ...
+handle.stop();
+handle.wait().await?;
 ```
 
 ```typescript TypeScript
@@ -49,7 +51,7 @@ const sb = await Sandbox.create({
     },
 })
 
-await egressIntercept(sb, {
+const intercept = await egressIntercept(sb, {
     onRequest: async (request, ctx) => {
         console.log(`→ ${request.method} ${request.uri} [${ctx.sni}]`)
         request.headers.push(["X-Trace-Id", "abc123"])
@@ -60,6 +62,8 @@ await egressIntercept(sb, {
         return undefined // pass through
     },
 })
+// ... do other work while interception is active ...
+await intercept.stop()
 ```
 
 ```python Python
@@ -80,7 +84,9 @@ async def on_response(response, request, ctx):
     print(f"← {response.status} [{ctx.sni}]")
     return None  # pass through
 
-await egress_intercept(sb, on_request=on_request, on_response=on_response)
+handle = await egress_intercept(sb, on_request=on_request, on_response=on_response)
+# ... do other work while interception is active ...
+await handle.stop()
 ```
 </CodeGroup>
 
@@ -104,7 +110,7 @@ Return a response object from `onRequest` to skip the server entirely. The guest
 use microsandbox::sandbox::egress::RequestAction;
 use microsandbox_network::egress::event::HttpResponse;
 
-conn.intercept(
+let handle = conn.intercept(
     |req, _ctx| {
         if req.uri.starts_with("/api/v1/models") {
             return Ok(Some(RequestAction::ShortCircuit(HttpResponse {
@@ -116,14 +122,14 @@ conn.intercept(
         Ok(None) // pass through everything else
     },
     |_resp, _req, _ctx| Ok(None),
-)
-.await?;
+);
+handle.wait().await?;
 ```
 
 ```typescript TypeScript
 import { egressIntercept } from 'microsandbox'
 
-await egressIntercept(sb, {
+const intercept = await egressIntercept(sb, {
     onRequest: async (request, ctx) => {
         if (request.uri.startsWith("/api/v1/models")) {
             return {
@@ -149,7 +155,7 @@ async def on_request(request, ctx):
         )
     return None  # pass through everything else
 
-await egress_intercept(sb, on_request=on_request)
+handle = await egress_intercept(sb, on_request=on_request)
 ```
 </CodeGroup>
 
@@ -159,7 +165,7 @@ Raise an error (or throw) from any hook to block the connection. The guest sees 
 
 <CodeGroup>
 ```rust Rust
-conn.intercept(
+let handle = conn.intercept(
     |req, _ctx| {
         if req.uri.contains("/admin") {
             return Err("blocked: admin endpoint".into());
@@ -167,14 +173,14 @@ conn.intercept(
         Ok(None)
     },
     |_resp, _req, _ctx| Ok(None),
-)
-.await?;
+);
+handle.wait().await?;
 ```
 
 ```typescript TypeScript
 import { egressIntercept } from 'microsandbox'
 
-await egressIntercept(sb, {
+const intercept = await egressIntercept(sb, {
     onRequest: async (request, ctx) => {
         if (request.uri.includes("/admin")) {
             throw new Error("blocked: admin endpoint")
@@ -192,7 +198,7 @@ async def on_request(request, ctx):
         raise Exception("blocked: admin endpoint")
     return None
 
-await egress_intercept(sb, on_request=on_request)
+handle = await egress_intercept(sb, on_request=on_request)
 ```
 </CodeGroup>
 

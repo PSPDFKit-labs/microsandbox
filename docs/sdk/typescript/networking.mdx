@@ -155,10 +155,10 @@ See [Egress Interception](/networking/egress) for conceptual overview.
 async function egressIntercept(
     sandbox: Sandbox,
     options: EgressInterceptOptions
-): Promise<void>
+): Promise<EgressInterceptHandle>
 ```
 
-Run egress interception with callback hooks. Blocks until the sandbox stops or the connection closes.
+Start egress interception with callback hooks. Connects to the sandbox's egress socket and starts processing events in the background. Returns an `EgressInterceptHandle` immediately.
 
 **Parameters**
 
@@ -166,6 +166,17 @@ Run egress interception with callback hooks. Blocks until the sandbox stops or t
 |-----------|------|-------------|
 | sandbox | `Sandbox` | A running sandbox with `egressInterceptHosts` configured |
 | options | [`EgressInterceptOptions`](#egressinterceptoptions) | `onRequest` and/or `onResponse` hooks |
+
+---
+
+### EgressInterceptHandle
+
+Handle for a running egress interception loop.
+
+| Member | Type | Description |
+|--------|------|-------------|
+| done | `Promise<void>` | Resolves when the loop ends naturally (sandbox stopped) |
+| stop() | `() => Promise<void>` | Signal the loop to stop and wait for completion |
 
 ---
 

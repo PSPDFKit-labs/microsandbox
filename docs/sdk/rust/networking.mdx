@@ -433,17 +433,17 @@ SDK-side connection to the runtime's egress interception socket. Obtained via [`
 #### intercept()
 
 ```rust
-async fn intercept<F, G>(
-    &mut self,
+fn intercept<F, G>(
+    self,
     on_request: F,
     on_response: G,
-) -> io::Result<()>
+) -> EgressInterceptHandle
 where
-    F: FnMut(&mut HttpRequest, &EgressContext) -> Result<Option<RequestAction>, Box<dyn Error>>,
-    G: FnMut(&mut HttpResponse, &HttpRequest, &EgressContext) -> Result<Option<HttpResponse>, Box<dyn Error>>,
+    F: FnMut(&mut HttpRequest, &EgressContext) -> Result<Option<RequestAction>, Box<dyn Error>> + Send + 'static,
+    G: FnMut(&mut HttpResponse, &HttpRequest, &EgressContext) -> Result<Option<HttpResponse>, Box<dyn Error>> + Send + 'static,
 ```
 
-Run the interception event loop with user-provided hooks. Blocks until the sandbox stops or the connection closes.
+Start the interception event loop with user-provided hooks. Consumes the connection, spawns a background Tokio task, and returns an [`EgressInterceptHandle`](#egressintercepthandle) immediately.
 
 **`on_request`** receives a mutable reference to the request and context:
 - Return `Ok(None)` to pass through unchanged
@@ -455,6 +455,17 @@ Run the interception event loop with user-provided hooks. Blocks until the sandb
 - Return `Ok(None)` to pass through unchanged
 - Return `Ok(Some(resp))` to forward a modified response
 - Return `Err(_)` to block the connection
+
+---
+
+### EgressInterceptHandle
+
+Handle for a running egress interception loop.
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| stop() | `fn stop(&self)` | Signal the event loop to stop after the current event |
+| wait() | `async fn wait(self) -> io::Result<()>` | Wait for the event loop to finish |
 
 ---
 

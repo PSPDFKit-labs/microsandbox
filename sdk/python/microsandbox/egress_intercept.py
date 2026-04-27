@@ -25,12 +25,15 @@ Example::
         print(f"← {response.status} [{ctx.sni}]")
         return None  # pass through
 
-    await egress_intercept(sb, on_request=on_request, on_response=on_response)
+    handle = await egress_intercept(sb, on_request=on_request, on_response=on_response)
+    # ... do other work while interception is active ...
+    await handle.stop()   # graceful shutdown
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -39,6 +42,28 @@ from microsandbox.events import (
     EgressHttpRequest,
     EgressHttpResponse,
 )
+
+
+class EgressInterceptHandle:
+    """Handle for a running egress interception loop.
+
+    Returned by :func:`egress_intercept`. The event loop runs in a
+    background asyncio task.
+    """
+
+    def __init__(self, task: asyncio.Task[None]) -> None:
+        self._task = task
+
+    @property
+    def done(self) -> asyncio.Task[None]:
+        """Awaitable that resolves when the loop ends naturally (sandbox stopped)."""
+        return self._task
+
+    async def stop(self) -> None:
+        """Cancel the intercept loop and wait for it to finish."""
+        self._task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await self._task
 
 
 def _dict_to_request(d: dict[str, Any]) -> EgressHttpRequest:
@@ -81,10 +106,12 @@ async def egress_intercept(
         [EgressHttpResponse, EgressHttpRequest | None, EgressContext],
         Awaitable[EgressHttpResponse | None] | EgressHttpResponse | None,
     ] | None = None,
-) -> None:
-    """Run egress interception with callback hooks.
+) -> EgressInterceptHandle:
+    """Start egress interception with callback hooks.
 
-    This function blocks until the sandbox stops or the connection is closed.
+    Connects to the sandbox's egress socket and starts processing events
+    in a background asyncio task. Returns an :class:`EgressInterceptHandle`
+    immediately.
 
     Args:
         sandbox: A running ``Sandbox`` instance with ``egress_intercept_hosts`` configured.
@@ -100,70 +127,78 @@ async def egress_intercept(
             - ``None`` → pass through unchanged
             - ``EgressHttpResponse`` → forward modified response to guest
             - raise any exception → block the connection
+
+    Returns:
+        A handle to control the interception loop.
     """
     conn = await sandbox.egress_connection()
-    last_requests: dict[int, EgressHttpRequest] = {}
 
-    while True:
-        event = await conn.recv()
-        if event is None:
-            break
+    async def _loop() -> None:
+        last_requests: dict[int, EgressHttpRequest] = {}
 
-        ctx = EgressContext(
-            sni=event["sni"],
-            dst=event["dst"],
-            connection_id=event["connection_id"],
-            timestamp_ms=event["timestamp_ms"],
-        )
-        event_id: int = event["id"]
-        connection_id: int = event["connection_id"]
+        while True:
+            event = await conn.recv()
+            if event is None:
+                break
 
-        try:
-            if event["kind"] == "request" and "request" in event:
-                request = _dict_to_request(event["request"])
-                last_requests[connection_id] = request
+            ctx = EgressContext(
+                sni=event["sni"],
+                dst=event["dst"],
+                connection_id=event["connection_id"],
+                timestamp_ms=event["timestamp_ms"],
+            )
+            event_id: int = event["id"]
+            connection_id: int = event["connection_id"]
 
-                if on_request is not None:
-                    result = on_request(request, ctx)
-                    if asyncio.iscoroutine(result):
-                        result = await result
+            try:
+                if event["kind"] == "request" and "request" in event:
+                    request = _dict_to_request(event["request"])
+                    last_requests[connection_id] = request
 
-                    if result is None:
-                        await conn.pass_through(event_id)
-                    elif _is_response(result):
-                        await conn.short_circuit(
-                            event_id, result.status,
-                            result.headers, result.body,
-                        )
+                    if on_request is not None:
+                        result = on_request(request, ctx)
+                        if asyncio.iscoroutine(result):
+                            result = await result
+
+                        if result is None:
+                            await conn.pass_through(event_id)
+                        elif _is_response(result):
+                            await conn.short_circuit(
+                                event_id, result.status,
+                                result.headers, result.body,
+                            )
+                        else:
+                            last_requests[connection_id] = result
+                            await conn.modify_request(
+                                event_id, result.method, result.uri,
+                                result.headers, result.body,
+                            )
                     else:
-                        last_requests[connection_id] = result
-                        await conn.modify_request(
-                            event_id, result.method, result.uri,
-                            result.headers, result.body,
-                        )
+                        await conn.pass_through(event_id)
+
+                elif event["kind"] == "response" and "response" in event:
+                    response = _dict_to_response(event["response"])
+                    original_request = last_requests.pop(connection_id, None)
+
+                    if on_response is not None:
+                        result = on_response(response, original_request, ctx)
+                        if asyncio.iscoroutine(result):
+                            result = await result
+
+                        if result is None:
+                            await conn.pass_through(event_id)
+                        else:
+                            await conn.modify_response(
+                                event_id, result.status,
+                                result.headers, result.body,
+                            )
+                    else:
+                        await conn.pass_through(event_id)
                 else:
                     await conn.pass_through(event_id)
 
-            elif event["kind"] == "response" and "response" in event:
-                response = _dict_to_response(event["response"])
-                original_request = last_requests.pop(connection_id, None)
+            except Exception:
+                await conn.block(event_id)
 
-                if on_response is not None:
-                    result = on_response(response, original_request, ctx)
-                    if asyncio.iscoroutine(result):
-                        result = await result
-
-                    if result is None:
-                        await conn.pass_through(event_id)
-                    else:
-                        await conn.modify_response(
-                            event_id, result.status,
-                            result.headers, result.body,
-                        )
-                else:
-                    await conn.pass_through(event_id)
-            else:
-                await conn.pass_through(event_id)
-
-        except Exception:
-            await conn.block(event_id)
+    task = asyncio.create_task(_loop())
+    return EgressInterceptHandle(task)

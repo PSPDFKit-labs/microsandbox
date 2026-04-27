@@ -323,10 +323,10 @@ async def egress_intercept(
     *,
     on_request: Callable | None = None,
     on_response: Callable | None = None,
-) -> None
+) -> EgressInterceptHandle
 ```
 
-Run egress interception with callback hooks. Blocks until the sandbox stops or the connection closes.
+Start egress interception with callback hooks. Connects to the sandbox's egress socket and starts processing events in a background asyncio task. Returns an `EgressInterceptHandle` immediately.
 
 **Parameters**
 
@@ -335,6 +335,17 @@ Run egress interception with callback hooks. Blocks until the sandbox stops or t
 | sandbox | `Sandbox` | - | A running sandbox with `egress_intercept_hosts` configured |
 | on_request | `async (request, ctx) -> EgressHttpRequest \| EgressHttpResponse \| None` | `None` | Called for each outbound request. Return modified request, response (short-circuit), `None` (pass through), or raise to block |
 | on_response | `async (response, request, ctx) -> EgressHttpResponse \| None` | `None` | Called for each server response. Return modified response, `None` (pass through), or raise to block |
+
+---
+
+### EgressInterceptHandle
+
+Handle for a running egress interception loop.
+
+| Member | Type | Description |
+|--------|------|-------------|
+| done | `asyncio.Task[None]` | Awaitable that resolves when the loop ends naturally (sandbox stopped) |
+| stop() | `async () -> None` | Cancel the loop and wait for it to finish |
 
 ---
 

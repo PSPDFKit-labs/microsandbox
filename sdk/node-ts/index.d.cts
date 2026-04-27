@@ -654,9 +654,7 @@ export interface NetworkConfig {
    * Empty/omitted = no interception.
    */
   egressInterceptHosts?: Array<string>
-  /**
-   * Maximum body bytes to capture per request/response (default: 64 MiB).
-   */
+  /** Maximum body bytes to capture per request/response (default: 64 MiB). */
   egressMaxBodyBytes?: number
   /**
    * Timeout (ms) for the SDK to respond with a decision (default: 5000).
