@@ -111,7 +111,15 @@ async fn tls_proxy_task(
 
     if tls_state.should_bypass(&sni_name) {
         tracing::debug!(sni = %sni_name, dst = %dst, "TLS bypass");
-        bypass_relay(dst, initial_buf, from_smoltcp, to_smoltcp, shared).await
+        bypass_relay(
+            dst,
+            &sni_name,
+            initial_buf,
+            from_smoltcp,
+            to_smoltcp,
+            shared,
+        )
+        .await
     } else {
         tracing::debug!(sni = %sni_name, dst = %dst, "TLS intercept");
         intercept_relay(
@@ -128,15 +136,46 @@ async fn tls_proxy_task(
     }
 }
 
+/// Connect to the upstream server, preferring IPv4.
+///
+/// Re-resolves the SNI hostname to get fresh addresses, trying IPv4 first.
+/// Falls back to the original `dst` if resolution fails or returns nothing.
+async fn connect_upstream(dst: SocketAddr, sni: &str) -> io::Result<TcpStream> {
+    let lookup_target = format!("{}:{}", sni, dst.port());
+    if let Ok(addrs) = tokio::net::lookup_host(&lookup_target).await {
+        let mut addrs: Vec<SocketAddr> = addrs.collect();
+        // Sort IPv4 first — many hosts lack IPv6 routes.
+        addrs.sort_by_key(|a| if a.is_ipv4() { 0 } else { 1 });
+
+        let mut last_err = None;
+        for addr in &addrs {
+            match TcpStream::connect(addr).await {
+                Ok(stream) => return Ok(stream),
+                Err(e) => {
+                    tracing::debug!(addr = %addr, sni = %sni, error = %e, "upstream connect failed, trying next");
+                    last_err = Some(e);
+                }
+            }
+        }
+        if let Some(e) = last_err {
+            return Err(e);
+        }
+    }
+
+    // Fallback: use original destination IP from the guest's connection.
+    TcpStream::connect(dst).await
+}
+
 /// Bypass mode: plain TCP splice, no TLS termination.
 async fn bypass_relay(
     dst: SocketAddr,
+    sni: &str,
     initial_buf: Vec<u8>,
     mut from_smoltcp: mpsc::Receiver<Bytes>,
     to_smoltcp: mpsc::Sender<Bytes>,
     shared: Arc<SharedState>,
 ) -> io::Result<()> {
-    let mut server = TcpStream::connect(dst).await?;
+    let mut server = connect_upstream(dst, sni).await?;
     server.write_all(&initial_buf).await?;
 
     let (mut server_rx, mut server_tx) = server.into_split();
@@ -230,7 +269,7 @@ async fn intercept_relay(
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TLS handshake timed out"))??;
 
     // Connect to real server with TLS.
-    let server_stream = TcpStream::connect(dst).await?;
+    let server_stream = connect_upstream(dst, sni_name).await?;
     let server_name = ServerName::try_from(sni_name.to_string())
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     let mut server_tls = tls_state
