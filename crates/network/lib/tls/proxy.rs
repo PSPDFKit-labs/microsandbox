@@ -19,7 +19,7 @@ use tokio::sync::{mpsc, oneshot};
 use super::sni;
 use super::state::TlsState;
 use crate::egress::event::{EgressAction, EgressEvent, EgressEventKind, HttpResponse};
-use crate::egress::framer::{FrameResult, RequestFramer, ResponseFramer};
+use crate::egress::framer::{ChunkedBodyTracker, FrameResult, RequestFramer, ResponseFramer};
 use crate::egress::publisher::{self, ProxyMessage};
 use crate::egress::serialize;
 use crate::secrets::config::HostPattern;
@@ -300,10 +300,17 @@ async fn intercept_relay(
     let mut req_held_back: Vec<u8> = Vec::with_capacity(65536);
     let mut resp_held_back: Vec<u8> = Vec::with_capacity(65536);
 
-    // Streaming state: when the response framer returns StreamBody
-    // (chunked / read-until-close), subsequent body bytes bypass the
-    // framer and go directly to the guest until connection close.
+    // Streaming state: when the response framer returns StreamBody,
+    // subsequent body bytes bypass the framer and go directly to the guest.
+    //
+    // For chunked responses, a `ChunkedBodyTracker` detects the terminal
+    // chunk so the proxy can exit streaming mode and resume framing the
+    // next HTTP message on the same keep-alive connection.
+    //
+    // For read-until-close responses (no Content-Length, no chunked),
+    // `chunked_tracker` is None and streaming continues until connection close.
     let mut resp_streaming = false;
+    let mut chunked_tracker: Option<ChunkedBodyTracker> = None;
 
     // Phase 2: Bidirectional plaintext relay (with optional wall-clock timeout).
     let egress_timeout_ms = egress.as_ref().map_or(0, |e| e.timeout_ms);
@@ -377,14 +384,57 @@ async fn intercept_relay(
                             let mut did_write = false;
 
                             if resp_streaming {
-                                // Streaming mode (chunked / read-until-close):
-                                // forward body bytes directly to guest until
-                                // connection close.
-                                guest_tls
-                                    .writer()
-                                    .write_all(server_data)
-                                    .map_err(io::Error::other)?;
-                                did_write = true;
+                                if let Some(ref mut tracker) = chunked_tracker {
+                                    // Chunked streaming: track the body to
+                                    // detect the terminal chunk.
+                                    if let Some(end_offset) = tracker.feed(server_data) {
+                                        // Terminal chunk found — write body
+                                        // bytes and exit streaming mode.
+                                        if end_offset > 0 {
+                                            guest_tls
+                                                .writer()
+                                                .write_all(&server_data[..end_offset])
+                                                .map_err(io::Error::other)?;
+                                        }
+                                        did_write = end_offset > 0;
+                                        resp_streaming = false;
+                                        chunked_tracker = None;
+
+                                        // Any bytes past end_offset are the
+                                        // start of the next HTTP response.
+                                        // Feed them to the response framer so
+                                        // they are parsed with subsequent data,
+                                        // and hold them back from the guest
+                                        // until the framer completes.
+                                        let remaining = &server_data[end_offset..];
+                                        if !remaining.is_empty() {
+                                            if let Some(framer) = &mut resp_framer {
+                                                // Pre-populate the framer's
+                                                // internal buffer. The result
+                                                // is almost certainly
+                                                // Incomplete (just a few header
+                                                // bytes) — ignore it here.
+                                                let _ = framer.feed(remaining);
+                                            }
+                                            resp_held_back.extend_from_slice(remaining);
+                                        }
+                                    } else {
+                                        // Still streaming — forward to guest.
+                                        guest_tls
+                                            .writer()
+                                            .write_all(server_data)
+                                            .map_err(io::Error::other)?;
+                                        did_write = true;
+                                    }
+                                } else {
+                                    // Read-until-close mode: forward body bytes
+                                    // directly to guest until connection close.
+                                    guest_tls
+                                        .writer()
+                                        .write_all(server_data)
+                                        .map_err(io::Error::other)?;
+                                    did_write = true;
+                                }
                             } else if let (Some(egress_handle), Some(framer)) = (&egress, &mut resp_framer) {
                                 match feed_response_framer(
                                     framer,
@@ -443,7 +493,7 @@ async fn intercept_relay(
                                             did_write = true;
                                         }
                                     },
-                                    ResponseFrameResult::StreamBody(action, spillover) => {
+                                    ResponseFrameResult::StreamBody(action, spillover, is_chunked) => {
                                         match action {
                                             EgressAction::PassThrough => {
                                                 // Flush held-back bytes (previous chunks) +
@@ -504,8 +554,40 @@ async fn intercept_relay(
                                                 did_write = true;
                                             }
                                         }
-                                        // Enter streaming mode — streams until connection close.
+                                        // Enter streaming mode.
                                         resp_streaming = true;
+
+                                        // For chunked responses, create a
+                                        // tracker so we can detect the terminal
+                                        // chunk and resume framing for the next
+                                        // HTTP message on this keep-alive
+                                        // connection.
+                                        if is_chunked {
+                                            let mut tracker = ChunkedBodyTracker::new();
+                                            // Feed the spillover (body bytes that
+                                            // arrived with the headers) to the
+                                            // tracker immediately.
+                                            if !spillover.is_empty() {
+                                                if let Some(end) = tracker.feed(&spillover) {
+                                                    // The entire chunked body was
+                                                    // in the spillover (unlikely
+                                                    // for SSE but possible for
+                                                    // short chunked responses).
+                                                    resp_streaming = false;
+                                                    let remaining = &spillover[end..];
+                                                    if !remaining.is_empty() {
+                                                        if let Some(framer) = &mut resp_framer {
+                                                            let _ = framer.feed(remaining);
+                                                        }
+                                                        resp_held_back.extend_from_slice(remaining);
+                                                    }
+                                                } else {
+                                                    chunked_tracker = Some(tracker);
+                                                }
+                                            } else {
+                                                chunked_tracker = Some(tracker);
+                                            }
+                                        }
                                     }
                                     ResponseFrameResult::BodyTooLarge => {
                                         // Content-Length response exceeds max_body_bytes — reject with 502.
@@ -722,8 +804,9 @@ enum ResponseFrameResult {
     /// Malformed chunked encoding — reject with 502.
     ParseError,
     /// Headers complete, body should be streamed (chunked / read-until-close).
-    /// Contains the SDK action and body spillover bytes.
-    StreamBody(EgressAction, Vec<u8>),
+    /// Contains the SDK action, body spillover bytes, and whether the response
+    /// uses chunked transfer encoding (true) or read-until-close (false).
+    StreamBody(EgressAction, Vec<u8>, bool),
     /// Protocol upgrade (101 Switching Protocols). Contains the hook action
     /// for the headers-only response.
     Upgrade(EgressAction),
@@ -752,6 +835,10 @@ async fn feed_response_framer(
             ResponseFrameResult::Action(action)
         }
         FrameResult::StreamBody(resp, _, spillover) => {
+            let is_chunked = resp.headers.iter().any(|(k, v)| {
+                k.eq_ignore_ascii_case("transfer-encoding")
+                    && v.to_ascii_lowercase().contains("chunked")
+            });
             let action = send_egress_event(
                 egress,
                 EgressEventKind::Response(resp),
@@ -760,7 +847,7 @@ async fn feed_response_framer(
                 connection_id,
             )
             .await;
-            ResponseFrameResult::StreamBody(action, spillover)
+            ResponseFrameResult::StreamBody(action, spillover, is_chunked)
         }
         FrameResult::Upgrade(resp, _) => {
             let action = send_egress_event(

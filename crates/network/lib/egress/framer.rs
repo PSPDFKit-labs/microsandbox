@@ -105,6 +105,162 @@ pub enum FrameResult<T> {
     ParseError,
 }
 
+/// Tracks chunked transfer encoding body to detect when the stream ends.
+///
+/// After the response framer returns `StreamBody` for a chunked response,
+/// the TLS proxy forwards body bytes directly to the guest. This tracker
+/// parses the chunked encoding on the fly to detect the terminal chunk
+/// (`0\r\n[trailers]\r\n`). When the stream ends, the proxy can exit
+/// streaming mode and resume framing subsequent HTTP messages on the same
+/// keep-alive connection.
+pub struct ChunkedBodyTracker {
+    state: TrackerState,
+}
+
+/// Internal state for `ChunkedBodyTracker`.
+enum TrackerState {
+    /// Reading hex digits of chunk-size.
+    Size { value: usize },
+    /// Non-hex character seen (chunk extension), scanning for CR.
+    SizeExt { size: usize },
+    /// CR seen after chunk-size line, expecting LF.
+    SizeLF { size: usize },
+    /// Skipping `remaining` bytes of chunk-data.
+    Data { remaining: usize },
+    /// All chunk-data consumed, expecting CR.
+    DataCR,
+    /// CR seen after chunk-data, expecting LF.
+    DataLF,
+    /// At the start of a trailer line (or the terminating empty line).
+    TrailerStart,
+    /// Inside a trailer field line, scanning for CR.
+    TrailerLine,
+    /// CR seen inside a trailer line, expecting LF.
+    TrailerLineLF,
+    /// CR seen at trailer-line start (empty line = end of trailers).
+    FinalLF,
+}
+
+impl Default for ChunkedBodyTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ChunkedBodyTracker {
+    /// Create a new tracker starting at the beginning of the chunked body.
+    pub fn new() -> Self {
+        Self {
+            state: TrackerState::Size { value: 0 },
+        }
+    }
+
+    /// Feed body bytes and return the byte offset just past the end of the
+    /// chunked body if the terminal chunk was found, or `None` if more data
+    /// is needed.
+    ///
+    /// When `Some(offset)` is returned, bytes `data[..offset]` belong to
+    /// the chunked body and bytes `data[offset..]` are the start of the
+    /// next HTTP message (if any).
+    pub fn feed(&mut self, data: &[u8]) -> Option<usize> {
+        let mut i = 0;
+        while i < data.len() {
+            match self.state {
+                TrackerState::Data { ref mut remaining } => {
+                    // Fast-skip chunk data bytes.
+                    let skip = (*remaining).min(data.len() - i);
+                    *remaining -= skip;
+                    i += skip;
+                    if *remaining == 0 {
+                        self.state = TrackerState::DataCR;
+                    }
+                }
+                _ => {
+                    let b = data[i];
+                    i += 1;
+                    match self.state {
+                        TrackerState::Size { ref mut value } => match b {
+                            b'0'..=b'9' => *value = value.wrapping_mul(16) + (b - b'0') as usize,
+                            b'a'..=b'f' => {
+                                *value = value.wrapping_mul(16) + (b - b'a' + 10) as usize
+                            }
+                            b'A'..=b'F' => {
+                                *value = value.wrapping_mul(16) + (b - b'A' + 10) as usize
+                            }
+                            b'\r' => {
+                                let size = *value;
+                                self.state = TrackerState::SizeLF { size };
+                            }
+                            _ => {
+                                // Chunk extension character.
+                                let size = *value;
+                                self.state = TrackerState::SizeExt { size };
+                            }
+                        },
+                        TrackerState::SizeExt { size } => {
+                            if b == b'\r' {
+                                self.state = TrackerState::SizeLF { size };
+                            }
+                        }
+                        TrackerState::SizeLF { size } => {
+                            if b == b'\n' {
+                                if size == 0 {
+                                    self.state = TrackerState::TrailerStart;
+                                } else {
+                                    self.state = TrackerState::Data { remaining: size };
+                                }
+                            } else {
+                                // Malformed — be lenient, treat as extension.
+                                self.state = TrackerState::SizeExt { size };
+                            }
+                        }
+                        TrackerState::Data { .. } => unreachable!(),
+                        TrackerState::DataCR => {
+                            if b == b'\r' {
+                                self.state = TrackerState::DataLF;
+                            }
+                            // else: malformed, but tolerate
+                        }
+                        TrackerState::DataLF => {
+                            if b == b'\n' {
+                                self.state = TrackerState::Size { value: 0 };
+                            }
+                            // else: malformed, but tolerate
+                        }
+                        TrackerState::TrailerStart => {
+                            if b == b'\r' {
+                                self.state = TrackerState::FinalLF;
+                            } else {
+                                self.state = TrackerState::TrailerLine;
+                            }
+                        }
+                        TrackerState::TrailerLine => {
+                            if b == b'\r' {
+                                self.state = TrackerState::TrailerLineLF;
+                            }
+                        }
+                        TrackerState::TrailerLineLF => {
+                            if b == b'\n' {
+                                self.state = TrackerState::TrailerStart;
+                            } else {
+                                self.state = TrackerState::TrailerLine;
+                            }
+                        }
+                        TrackerState::FinalLF => {
+                            if b == b'\n' {
+                                return Some(i);
+                            }
+                            // Not actually the final empty line — treat as trailer.
+                            self.state = TrackerState::TrailerLine;
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
 /// Result from chunk processing.
 enum ChunkProcessResult {
     /// All chunks consumed, body complete.
@@ -1276,5 +1432,123 @@ mod tests {
             }
         }
         panic!("never got StreamBody");
+    }
+
+    // ── ChunkedBodyTracker tests ─────────────────────────────────────────
+
+    #[test]
+    fn tracker_simple_single_chunk() {
+        let mut tracker = ChunkedBodyTracker::new();
+        let input = b"5\r\nhello\r\n0\r\n\r\n";
+        let end = tracker.feed(input).expect("should detect end");
+        assert_eq!(end, input.len());
+    }
+
+    #[test]
+    fn tracker_multi_chunk() {
+        let mut tracker = ChunkedBodyTracker::new();
+        let input = b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+        let end = tracker.feed(input).expect("should detect end");
+        assert_eq!(end, input.len());
+    }
+
+    #[test]
+    fn tracker_split_across_feeds() {
+        let mut tracker = ChunkedBodyTracker::new();
+        assert!(tracker.feed(b"5\r\nhel").is_none());
+        assert!(tracker.feed(b"lo\r\n0").is_none());
+        let end = tracker.feed(b"\r\n\r\n").expect("should detect end");
+        assert_eq!(end, 4); // all 4 bytes consumed: \r\n\r\n
+    }
+
+    #[test]
+    fn tracker_terminal_chunk_split_cr_lf() {
+        // Split right between \r and \n of the final empty line.
+        let mut tracker = ChunkedBodyTracker::new();
+        assert!(tracker.feed(b"0\r\n\r").is_none());
+        let end = tracker.feed(b"\n").expect("should detect end");
+        assert_eq!(end, 1);
+    }
+
+    #[test]
+    fn tracker_with_trailers() {
+        let mut tracker = ChunkedBodyTracker::new();
+        let input = b"5\r\nhello\r\n0\r\nX-Checksum: abc\r\n\r\n";
+        let end = tracker.feed(input).expect("should detect end");
+        assert_eq!(end, input.len());
+    }
+
+    #[test]
+    fn tracker_with_multiple_trailers() {
+        let mut tracker = ChunkedBodyTracker::new();
+        let input = b"3\r\nabc\r\n0\r\nTrailer-A: 1\r\nTrailer-B: 2\r\n\r\n";
+        let end = tracker.feed(input).expect("should detect end");
+        assert_eq!(end, input.len());
+    }
+
+    #[test]
+    fn tracker_spillover_after_terminal() {
+        // Bytes after the chunked body belong to the next HTTP message.
+        let mut tracker = ChunkedBodyTracker::new();
+        let input = b"0\r\n\r\nHTTP/1.1 200 OK\r\n";
+        let end = tracker.feed(input).expect("should detect end");
+        assert_eq!(end, 5); // "0\r\n\r\n" = 5 bytes
+        assert_eq!(&input[end..], b"HTTP/1.1 200 OK\r\n");
+    }
+
+    #[test]
+    fn tracker_chunk_extension() {
+        // Chunk extensions after ';' should be tolerated.
+        let mut tracker = ChunkedBodyTracker::new();
+        let input = b"5;ext=val\r\nhello\r\n0\r\n\r\n";
+        let end = tracker.feed(input).expect("should detect end");
+        assert_eq!(end, input.len());
+    }
+
+    #[test]
+    fn tracker_large_chunk_skips_efficiently() {
+        let mut tracker = ChunkedBodyTracker::new();
+        // 1MB chunk — the tracker should skip data without byte-by-byte iteration.
+        let size_line = b"100000\r\n";
+        assert!(tracker.feed(size_line).is_none());
+
+        // Feed 1MB of data in 64KB blocks.
+        let block = vec![b'x'; 65536];
+        for _ in 0..16 {
+            assert!(tracker.feed(&block).is_none());
+        }
+
+        // CRLF after data + terminal chunk.
+        let tail = b"\r\n0\r\n\r\n";
+        let end = tracker.feed(tail).expect("should detect end");
+        assert_eq!(end, tail.len());
+    }
+
+    #[test]
+    fn tracker_empty_feeds_are_no_ops() {
+        let mut tracker = ChunkedBodyTracker::new();
+        assert!(tracker.feed(b"").is_none());
+        assert!(tracker.feed(b"").is_none());
+        // Should still work after empty feeds.
+        let input = b"0\r\n\r\n";
+        let end = tracker.feed(input).expect("should detect end");
+        assert_eq!(end, input.len());
+    }
+
+    #[test]
+    fn tracker_byte_at_a_time() {
+        let mut tracker = ChunkedBodyTracker::new();
+        let input = b"3\r\nabc\r\n0\r\n\r\n";
+        for (i, &byte) in input.iter().enumerate() {
+            match tracker.feed(&[byte]) {
+                Some(end) => {
+                    assert_eq!(end, 1); // consumed this single byte
+                    assert_eq!(i, input.len() - 1); // should be the last byte
+                    return;
+                }
+                None => {}
+            }
+        }
+        panic!("tracker never detected end");
     }
 }
