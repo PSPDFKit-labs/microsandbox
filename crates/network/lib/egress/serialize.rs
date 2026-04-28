@@ -102,6 +102,33 @@ pub fn serialize_response(resp: &HttpResponse) -> Vec<u8> {
     buf
 }
 
+/// Serialize only the headers of an [`HttpResponse`] to HTTP/1.1 wire bytes.
+///
+/// Unlike [`serialize_response`], this preserves original `Content-Length` and
+/// `Transfer-Encoding` headers so the body can stream through with its
+/// original framing intact. Used for `ModifyResponse` on streamed responses.
+pub fn serialize_response_headers_only(resp: &HttpResponse) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(256);
+
+    // Status line.
+    buf.extend_from_slice(b"HTTP/1.1 ");
+    buf.extend_from_slice(resp.status.to_string().as_bytes());
+    buf.push(b' ');
+    buf.extend_from_slice(reason_phrase(resp.status).as_bytes());
+    buf.extend_from_slice(b"\r\n");
+
+    // Headers — preserved as-is.
+    for (name, value) in &resp.headers {
+        buf.extend_from_slice(name.as_bytes());
+        buf.extend_from_slice(b": ");
+        buf.extend_from_slice(value.as_bytes());
+        buf.extend_from_slice(b"\r\n");
+    }
+
+    buf.extend_from_slice(b"\r\n");
+    buf
+}
+
 /// Standard reason phrase for common status codes.
 fn reason_phrase(status: u16) -> &'static str {
     match status {
@@ -293,6 +320,7 @@ mod tests {
             FrameResult::Incomplete => panic!("expected complete from round-trip"),
             FrameResult::BodyTooLarge => panic!("unexpected body too large"),
             FrameResult::Upgrade(_, _) => panic!("unexpected upgrade"),
+            FrameResult::StreamBody(..) => panic!("unexpected stream body"),
             FrameResult::ParseError => panic!("unexpected parse error"),
         }
     }
@@ -325,7 +353,27 @@ mod tests {
             FrameResult::Incomplete => panic!("expected complete from round-trip"),
             FrameResult::BodyTooLarge => panic!("unexpected body too large"),
             FrameResult::Upgrade(_, _) => panic!("unexpected upgrade"),
+            FrameResult::StreamBody(..) => panic!("unexpected stream body"),
             FrameResult::ParseError => panic!("unexpected parse error"),
         }
+    }
+
+    #[test]
+    fn serialize_response_headers_only_preserves_content_length_and_te() {
+        let resp = HttpResponse {
+            status: 200,
+            headers: vec![
+                ("Content-Type".into(), "application/octet-stream".into()),
+                ("Content-Length".into(), "3500000".into()),
+                ("Transfer-Encoding".into(), "chunked".into()),
+            ],
+            body: None,
+        };
+        let bytes = serialize_response_headers_only(&resp);
+        let s = String::from_utf8(bytes).unwrap();
+        assert!(s.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(s.contains("Content-Length: 3500000\r\n"));
+        assert!(s.contains("Transfer-Encoding: chunked\r\n"));
+        assert!(s.ends_with("\r\n\r\n"));
     }
 }

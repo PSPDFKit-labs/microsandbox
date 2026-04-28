@@ -300,6 +300,11 @@ async fn intercept_relay(
     let mut req_held_back: Vec<u8> = Vec::with_capacity(65536);
     let mut resp_held_back: Vec<u8> = Vec::with_capacity(65536);
 
+    // Streaming state: when the response framer returns StreamBody
+    // (chunked / read-until-close), subsequent body bytes bypass the
+    // framer and go directly to the guest until connection close.
+    let mut resp_streaming = false;
+
     // Phase 2: Bidirectional plaintext relay (with optional wall-clock timeout).
     let egress_timeout_ms = egress.as_ref().map_or(0, |e| e.timeout_ms);
     let relay_result = async {
@@ -365,81 +370,22 @@ async fn intercept_relay(
                 result = server_tls.read(&mut server_buf) => {
                     match result {
                         Ok(0) => {
-                            // Server closed — finalize any in-progress response.
-                            if let (Some(egress_handle), Some(framer)) = (&egress, &mut resp_framer)
-                                && let FrameResult::Complete(resp, _) = framer.feed_eof()
-                            {
-                                    let action = send_egress_event(
-                                        egress_handle,
-                                        EgressEventKind::Response(resp),
-                                        sni_name,
-                                        dst,
-                                        connection_id,
-                                    )
-                                    .await;
-                                    match action {
-                                        EgressAction::PassThrough => {
-                                            if !resp_held_back.is_empty() {
-                                                guest_tls
-                                                    .writer()
-                                                    .write_all(&resp_held_back)
-                                                    .map_err(io::Error::other)?;
-                                                resp_held_back.clear();
-                                            }
-                                            flush_to_guest(
-                                                &mut guest_tls,
-                                                &to_smoltcp,
-                                                &shared,
-                                                &mut tls_buf,
-                                            )
-                                            .await?;
-                                        }
-                                        EgressAction::ModifyResponse(resp) => {
-                                            resp_held_back.clear();
-                                            let wire = serialize::serialize_response(&resp);
-                                            guest_tls
-                                                .writer()
-                                                .write_all(&wire)
-                                                .map_err(io::Error::other)?;
-                                            flush_to_guest(
-                                                &mut guest_tls,
-                                                &to_smoltcp,
-                                                &shared,
-                                                &mut tls_buf,
-                                            )
-                                            .await?;
-                                        }
-                                        EgressAction::Block => {
-                                            resp_held_back.clear();
-                                        }
-                                        _ => {
-                                            if !resp_held_back.is_empty() {
-                                                guest_tls
-                                                    .writer()
-                                                    .write_all(&resp_held_back)
-                                                    .map_err(io::Error::other)?;
-                                                resp_held_back.clear();
-                                            }
-                                            flush_to_guest(
-                                                &mut guest_tls,
-                                                &to_smoltcp,
-                                                &shared,
-                                                &mut tls_buf,
-                                            )
-                                            .await?;
-                                        }
-                                    }
-                            }
                             break;
                         }
                         Ok(n) => {
                             let server_data = &server_buf[..n];
-
-                            // Feed response bytes to egress framer and handle decisions.
-                            // We hold back raw bytes until the framer completes to avoid
-                            // double-forwarding when the hook modifies the response.
                             let mut did_write = false;
-                            if let (Some(egress_handle), Some(framer)) = (&egress, &mut resp_framer) {
+
+                            if resp_streaming {
+                                // Streaming mode (chunked / read-until-close):
+                                // forward body bytes directly to guest until
+                                // connection close.
+                                guest_tls
+                                    .writer()
+                                    .write_all(server_data)
+                                    .map_err(io::Error::other)?;
+                                did_write = true;
+                            } else if let (Some(egress_handle), Some(framer)) = (&egress, &mut resp_framer) {
                                 match feed_response_framer(
                                     framer,
                                     server_data,
@@ -497,8 +443,72 @@ async fn intercept_relay(
                                             did_write = true;
                                         }
                                     },
+                                    ResponseFrameResult::StreamBody(action, spillover) => {
+                                        match action {
+                                            EgressAction::PassThrough => {
+                                                // Flush held-back bytes (previous chunks) +
+                                                // current server_data (final header bytes + body).
+                                                // We write the full server_data rather than just
+                                                // spillover because the framer consumed the header
+                                                // tail from this chunk — resp_held_back only has
+                                                // bytes from prior Incomplete feeds.
+                                                if !resp_held_back.is_empty() {
+                                                    guest_tls
+                                                        .writer()
+                                                        .write_all(&resp_held_back)
+                                                        .map_err(io::Error::other)?;
+                                                    resp_held_back.clear();
+                                                }
+                                                guest_tls
+                                                    .writer()
+                                                    .write_all(server_data)
+                                                    .map_err(io::Error::other)?;
+                                                did_write = true;
+                                            }
+                                            EgressAction::ModifyResponse(resp) => {
+                                                // Discard raw headers, write re-serialized headers + spillover.
+                                                resp_held_back.clear();
+                                                let wire = serialize::serialize_response_headers_only(&resp);
+                                                guest_tls
+                                                    .writer()
+                                                    .write_all(&wire)
+                                                    .map_err(io::Error::other)?;
+                                                if !spillover.is_empty() {
+                                                    guest_tls
+                                                        .writer()
+                                                        .write_all(&spillover)
+                                                        .map_err(io::Error::other)?;
+                                                }
+                                                did_write = true;
+                                            }
+                                            EgressAction::Block => {
+                                                resp_held_back.clear();
+                                                return Err(io::Error::new(
+                                                    io::ErrorKind::ConnectionAborted,
+                                                    "egress: streamed response blocked by hook",
+                                                ));
+                                            }
+                                            _ => {
+                                                // Unknown action — treat as pass-through.
+                                                if !resp_held_back.is_empty() {
+                                                    guest_tls
+                                                        .writer()
+                                                        .write_all(&resp_held_back)
+                                                        .map_err(io::Error::other)?;
+                                                    resp_held_back.clear();
+                                                }
+                                                guest_tls
+                                                    .writer()
+                                                    .write_all(server_data)
+                                                    .map_err(io::Error::other)?;
+                                                did_write = true;
+                                            }
+                                        }
+                                        // Enter streaming mode — streams until connection close.
+                                        resp_streaming = true;
+                                    }
                                     ResponseFrameResult::BodyTooLarge => {
-                                        // Discard held-back bytes, reject with 502.
+                                        // Content-Length response exceeds max_body_bytes — reject with 502.
                                         resp_held_back.clear();
                                         let max = egress.as_ref().map_or(0, |e| e.max_body_bytes);
                                         tracing::warn!(
@@ -707,10 +717,13 @@ enum ResponseFrameResult {
     Action(EgressAction),
     /// Not enough data yet — holdback decision.
     Incomplete,
-    /// Response body exceeds max — reject with 502.
+    /// Response body exceeds max_body_bytes — reject with 502.
     BodyTooLarge,
     /// Malformed chunked encoding — reject with 502.
     ParseError,
+    /// Headers complete, body should be streamed (chunked / read-until-close).
+    /// Contains the SDK action and body spillover bytes.
+    StreamBody(EgressAction, Vec<u8>),
     /// Protocol upgrade (101 Switching Protocols). Contains the hook action
     /// for the headers-only response.
     Upgrade(EgressAction),
@@ -737,6 +750,17 @@ async fn feed_response_framer(
             )
             .await;
             ResponseFrameResult::Action(action)
+        }
+        FrameResult::StreamBody(resp, _, spillover) => {
+            let action = send_egress_event(
+                egress,
+                EgressEventKind::Response(resp),
+                sni,
+                dst,
+                connection_id,
+            )
+            .await;
+            ResponseFrameResult::StreamBody(action, spillover)
         }
         FrameResult::Upgrade(resp, _) => {
             let action = send_egress_event(
@@ -961,6 +985,9 @@ async fn forward_plaintext_with_egress(
                 }
                 FrameResult::Upgrade(_, _) => {
                     unreachable!("request framer should not return Upgrade");
+                }
+                FrameResult::StreamBody(..) => {
+                    unreachable!("request framer should not return StreamBody");
                 }
             }
         }

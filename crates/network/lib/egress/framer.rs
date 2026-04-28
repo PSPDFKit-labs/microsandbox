@@ -46,7 +46,8 @@ enum FramerState {
         body_mode: BodyMode,
         body_buf: Vec<u8>,
     },
-    /// Buffering a chunked body.
+    /// Buffering a chunked body (used by `RequestFramer`; `ResponseFramer`
+    /// returns `StreamBody` for chunked responses instead).
     BufferingChunked {
         headers_end: usize,
         body_buf: Vec<u8>,
@@ -54,12 +55,6 @@ enum FramerState {
         /// Number of chunk-encoded bytes already consumed by `process_chunks`.
         /// Prevents re-processing old data when `feed()` is called multiple times.
         chunk_bytes_consumed: usize,
-    },
-    /// Buffering a read-until-close body (no Content-Length, no chunked).
-    /// Completes only via `feed_eof()`.
-    BufferingUntilClose {
-        headers_end: usize,
-        body_buf: Vec<u8>,
     },
 }
 
@@ -94,6 +89,13 @@ pub enum FrameResult<T> {
     Complete(T, usize),
     /// The message body exceeds the configured maximum size.
     BodyTooLarge,
+    /// Headers are complete but the body is unbounded (chunked or
+    /// read-until-close). Contains: headers-only message, header bytes
+    /// consumed, and body spillover (bytes after the header boundary
+    /// already in the buffer). The caller must forward the spillover
+    /// immediately and then stream remaining body bytes without feeding
+    /// them to the framer.
+    StreamBody(T, usize, Vec<u8>),
     /// Protocol upgrade (101 Switching Protocols). Contains a headers-only
     /// message. Caller should stop framing both directions and switch to
     /// raw byte forwarding.
@@ -329,10 +331,6 @@ impl RequestFramer {
                         }
                     }
                 }
-
-                FramerState::BufferingUntilClose { .. } => {
-                    unreachable!("request framer does not use BufferingUntilClose");
-                }
             }
         }
     }
@@ -418,11 +416,17 @@ impl ResponseFramer {
                             }
                             // Other responses without Content-Length or
                             // Transfer-Encoding use read-until-close —
-                            // buffer until `feed_eof()`.
-                            self.state = FramerState::BufferingUntilClose {
-                                headers_end: boundary,
-                                body_buf: Vec::new(),
-                            };
+                            // stream body through without buffering.
+                            let response = build_response_from_parts(
+                                status,
+                                &headers_arr[..header_count],
+                                None,
+                            );
+                            let consumed = boundary;
+                            let spillover = self.buf[consumed..].to_vec();
+                            self.buf.clear();
+                            self.state = FramerState::AwaitingHeaders;
+                            return FrameResult::StreamBody(response, consumed, spillover);
                         }
                         BodyDetermination::ContentLength(len) => {
                             if len > self.max_body_bytes {
@@ -437,14 +441,18 @@ impl ResponseFramer {
                             };
                         }
                         BodyDetermination::Chunked => {
-                            self.state = FramerState::BufferingChunked {
-                                headers_end: boundary,
-                                body_buf: Vec::new(),
-                                chunk_state: ChunkState::ReadingSize {
-                                    size_buf: Vec::new(),
-                                },
-                                chunk_bytes_consumed: 0,
-                            };
+                            // Chunked bodies are unbounded — emit headers-only
+                            // and let caller stream body through.
+                            let response = build_response_from_parts(
+                                status,
+                                &headers_arr[..header_count],
+                                None,
+                            );
+                            let consumed = boundary;
+                            let spillover = self.buf[consumed..].to_vec();
+                            self.buf.clear();
+                            self.state = FramerState::AwaitingHeaders;
+                            return FrameResult::StreamBody(response, consumed, spillover);
                         }
                     }
                 }
@@ -502,120 +510,11 @@ impl ResponseFramer {
                     return FrameResult::Complete(response, consumed);
                 }
 
-                FramerState::BufferingChunked {
-                    headers_end,
-                    body_buf,
-                    chunk_state,
-                    chunk_bytes_consumed,
-                } => {
-                    let headers_end_val = *headers_end;
-                    let body_start = headers_end_val;
-
-                    // Only process NEW chunk data (skip already-consumed bytes).
-                    let chunk_data = &self.buf[body_start + *chunk_bytes_consumed..];
-                    let result =
-                        process_chunks(chunk_data, chunk_state, body_buf, self.max_body_bytes);
-
-                    match result {
-                        ChunkProcessResult::Incomplete => {
-                            *chunk_bytes_consumed = self.buf.len() - body_start;
-                            return FrameResult::Incomplete;
-                        }
-                        ChunkProcessResult::TooLarge => {
-                            self.buf.clear();
-                            self.state = FramerState::AwaitingHeaders;
-                            return FrameResult::BodyTooLarge;
-                        }
-                        ChunkProcessResult::ParseError => {
-                            self.buf.clear();
-                            self.state = FramerState::AwaitingHeaders;
-                            return FrameResult::ParseError;
-                        }
-                        ChunkProcessResult::Done(bytes_consumed) => {
-                            let body = if self.max_body_bytes > 0 {
-                                Some(std::mem::take(body_buf))
-                            } else {
-                                None
-                            };
-
-                            let header_bytes = &self.buf[..headers_end_val];
-                            let mut headers_arr = [httparse::EMPTY_HEADER; MAX_HEADERS];
-                            let (count, status) = {
-                                let mut resp = httparse::Response::new(&mut headers_arr);
-                                if resp.parse(header_bytes).is_err() {
-                                    self.buf.clear();
-                                    self.state = FramerState::AwaitingHeaders;
-                                    return FrameResult::ParseError;
-                                }
-                                (resp.headers.len(), resp.code.unwrap_or(200))
-                            };
-
-                            let response =
-                                build_response_from_parts(status, &headers_arr[..count], body);
-                            let consumed = body_start + *chunk_bytes_consumed + bytes_consumed;
-                            self.buf.drain(..consumed);
-                            self.state = FramerState::AwaitingHeaders;
-                            return FrameResult::Complete(response, consumed);
-                        }
-                    }
+                // ResponseFramer never enters BufferingChunked — chunked
+                // responses return StreamBody from AwaitingHeaders.
+                FramerState::BufferingChunked { .. } => {
+                    unreachable!("ResponseFramer should never enter BufferingChunked");
                 }
-
-                FramerState::BufferingUntilClose {
-                    headers_end,
-                    body_buf,
-                } => {
-                    let body_start = *headers_end;
-                    let new_data = &self.buf[body_start + body_buf.len()..];
-                    if body_buf.len() + new_data.len() > self.max_body_bytes {
-                        self.buf.clear();
-                        self.state = FramerState::AwaitingHeaders;
-                        return FrameResult::BodyTooLarge;
-                    }
-                    body_buf.extend_from_slice(new_data);
-                    return FrameResult::Incomplete;
-                }
-            }
-        }
-    }
-
-    /// Signal that the server closed the connection.
-    ///
-    /// Finalizes any in-progress response body (read-until-close or
-    /// partial chunked where the server closed before the terminal chunk).
-    pub fn feed_eof(&mut self) -> FrameResult<HttpResponse> {
-        match std::mem::replace(&mut self.state, FramerState::AwaitingHeaders) {
-            FramerState::BufferingUntilClose {
-                headers_end,
-                body_buf,
-            }
-            | FramerState::BufferingChunked {
-                headers_end,
-                body_buf,
-                ..
-            } => {
-                let header_bytes = &self.buf[..headers_end];
-                let mut headers_arr = [httparse::EMPTY_HEADER; MAX_HEADERS];
-                let (count, status) = {
-                    let mut resp = httparse::Response::new(&mut headers_arr);
-                    if resp.parse(header_bytes).is_err() {
-                        self.buf.clear();
-                        return FrameResult::ParseError;
-                    }
-                    (resp.headers.len(), resp.code.unwrap_or(200))
-                };
-                let body = if self.max_body_bytes > 0 && !body_buf.is_empty() {
-                    Some(body_buf)
-                } else {
-                    None
-                };
-                let response = build_response_from_parts(status, &headers_arr[..count], body);
-                self.buf.clear();
-                FrameResult::Complete(response, 0)
-            }
-            _ => {
-                // AwaitingHeaders or BufferingBody — nothing useful to emit.
-                self.buf.clear();
-                FrameResult::Incomplete
             }
         }
     }
@@ -863,6 +762,7 @@ mod tests {
             FrameResult::BodyTooLarge => panic!("unexpected body too large"),
             FrameResult::Upgrade(_, _) => panic!("unexpected streaming"),
             FrameResult::ParseError => panic!("unexpected parse error"),
+            FrameResult::StreamBody(..) => panic!("unexpected stream body"),
         }
     }
 
@@ -880,6 +780,7 @@ mod tests {
             FrameResult::BodyTooLarge => panic!("unexpected body too large"),
             FrameResult::Upgrade(_, _) => panic!("unexpected streaming"),
             FrameResult::ParseError => panic!("unexpected parse error"),
+            FrameResult::StreamBody(..) => panic!("unexpected stream body"),
         }
     }
 
@@ -916,6 +817,7 @@ mod tests {
             FrameResult::BodyTooLarge => panic!("unexpected body too large"),
             FrameResult::Upgrade(_, _) => panic!("unexpected streaming"),
             FrameResult::ParseError => panic!("unexpected parse error"),
+            FrameResult::StreamBody(..) => panic!("unexpected stream body"),
         }
     }
 
@@ -932,6 +834,7 @@ mod tests {
             FrameResult::BodyTooLarge => panic!("unexpected body too large"),
             FrameResult::Upgrade(_, _) => panic!("unexpected streaming"),
             FrameResult::ParseError => panic!("unexpected parse error"),
+            FrameResult::StreamBody(..) => panic!("unexpected stream body"),
         }
     }
 
@@ -947,6 +850,7 @@ mod tests {
             FrameResult::BodyTooLarge => panic!("unexpected body too large"),
             FrameResult::Upgrade(_, _) => panic!("unexpected streaming"),
             FrameResult::ParseError => panic!("unexpected parse error"),
+            FrameResult::StreamBody(..) => panic!("unexpected stream body"),
         }
     }
 
@@ -963,6 +867,7 @@ mod tests {
             FrameResult::BodyTooLarge => panic!("unexpected body too large"),
             FrameResult::Upgrade(_, _) => panic!("unexpected streaming"),
             FrameResult::ParseError => panic!("unexpected parse error"),
+            FrameResult::StreamBody(..) => panic!("unexpected stream body"),
         }
     }
 
@@ -1004,6 +909,7 @@ mod tests {
             FrameResult::BodyTooLarge => panic!("unexpected body too large"),
             FrameResult::Upgrade(_, _) => panic!("unexpected streaming"),
             FrameResult::ParseError => panic!("unexpected parse error"),
+            FrameResult::StreamBody(..) => panic!("unexpected stream body"),
         }
 
         // Second request should be parseable from remaining buffer.
@@ -1015,6 +921,7 @@ mod tests {
             FrameResult::BodyTooLarge => panic!("unexpected body too large"),
             FrameResult::Upgrade(_, _) => panic!("unexpected streaming"),
             FrameResult::ParseError => panic!("unexpected parse error"),
+            FrameResult::StreamBody(..) => panic!("unexpected stream body"),
         }
     }
 
@@ -1031,16 +938,24 @@ mod tests {
             FrameResult::BodyTooLarge => panic!("unexpected body too large"),
             FrameResult::Upgrade(_, _) => panic!("unexpected streaming"),
             FrameResult::ParseError => panic!("unexpected parse error"),
+            FrameResult::StreamBody(..) => panic!("unexpected stream body"),
         }
     }
 
     #[test]
-    fn response_200_no_content_length_buffers_until_eof() {
+    fn response_200_no_content_length_returns_stream_body() {
         // A 200 response without Content-Length or Transfer-Encoding uses
-        // read-until-close per RFC 7230 §3.3.3 — buffers until feed_eof().
+        // read-until-close — returns StreamBody so the caller streams body through.
         let mut framer = ResponseFramer::new(1024);
         let input = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n";
-        assert!(matches!(framer.feed(input), FrameResult::Incomplete));
+        match framer.feed(input) {
+            FrameResult::StreamBody(resp, _, spillover) => {
+                assert_eq!(resp.status, 200);
+                assert!(resp.body.is_none());
+                assert!(spillover.is_empty());
+            }
+            other => panic!("expected StreamBody, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1077,15 +992,17 @@ mod tests {
     }
 
     #[test]
-    fn response_chunked_buffers_body() {
+    fn response_chunked_returns_stream_body() {
         let mut framer = ResponseFramer::new(1024);
         let input = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
         match framer.feed(input) {
-            FrameResult::Complete(resp, _) => {
+            FrameResult::StreamBody(resp, _, spillover) => {
                 assert_eq!(resp.status, 200);
-                assert_eq!(resp.body.as_deref(), Some(b"hello".as_slice()));
+                assert!(resp.body.is_none());
+                // Spillover contains the chunk data that arrived with headers.
+                assert_eq!(spillover, b"5\r\nhello\r\n0\r\n\r\n");
             }
-            other => panic!("expected Complete, got {other:?}"),
+            other => panic!("expected StreamBody, got {other:?}"),
         }
     }
 
@@ -1147,6 +1064,7 @@ mod tests {
             FrameResult::BodyTooLarge => panic!("unexpected body too large"),
             FrameResult::Upgrade(_, _) => panic!("unexpected streaming"),
             FrameResult::ParseError => panic!("unexpected parse error"),
+            FrameResult::StreamBody(..) => panic!("unexpected stream body"),
         }
     }
 
@@ -1165,6 +1083,7 @@ mod tests {
             FrameResult::BodyTooLarge => panic!("unexpected body too large"),
             FrameResult::Upgrade(_, _) => panic!("unexpected streaming"),
             FrameResult::ParseError => panic!("unexpected parse error"),
+            FrameResult::StreamBody(..) => panic!("unexpected stream body"),
         }
     }
 
@@ -1182,6 +1101,7 @@ mod tests {
             FrameResult::BodyTooLarge => panic!("unexpected body too large"),
             FrameResult::Upgrade(_, _) => panic!("unexpected streaming"),
             FrameResult::ParseError => panic!("unexpected parse error"),
+            FrameResult::StreamBody(..) => panic!("unexpected stream body"),
         }
     }
 
@@ -1215,134 +1135,99 @@ mod tests {
             FrameResult::BodyTooLarge => panic!("unexpected body too large"),
             FrameResult::Upgrade(_, _) => panic!("unexpected upgrade"),
             FrameResult::ParseError => panic!("unexpected parse error"),
+            FrameResult::StreamBody(..) => panic!("unexpected stream body"),
         }
     }
 
     #[test]
-    fn response_feed_eof_completes_read_until_close() {
+    fn response_read_until_close_returns_stream_body_with_spillover() {
         let mut framer = ResponseFramer::new(1024);
-        // 200 without Content-Length — read-until-close.
-        let headers = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n";
-        assert!(matches!(framer.feed(headers), FrameResult::Incomplete));
-
-        // Feed some body bytes.
-        assert!(matches!(framer.feed(b"hello "), FrameResult::Incomplete));
-        assert!(matches!(framer.feed(b"world"), FrameResult::Incomplete));
-
-        // Server closes — feed_eof() should emit Complete with buffered body.
-        match framer.feed_eof() {
-            FrameResult::Complete(resp, _) => {
+        // 200 without Content-Length — read-until-close → StreamBody.
+        let input = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nhello world";
+        match framer.feed(input) {
+            FrameResult::StreamBody(resp, _, spillover) => {
                 assert_eq!(resp.status, 200);
-                assert_eq!(resp.body.as_deref(), Some(b"hello world".as_slice()));
+                assert!(resp.body.is_none());
+                assert_eq!(spillover, b"hello world");
             }
-            other => panic!("expected Complete from feed_eof, got {other:?}"),
+            other => panic!("expected StreamBody, got {other:?}"),
         }
     }
 
     #[test]
-    fn response_feed_eof_completes_partial_chunked() {
+    fn response_chunked_partial_returns_stream_body() {
+        // Chunked response — returns StreamBody immediately with spillover.
         let mut framer = ResponseFramer::new(1024);
-        // Chunked response with one chunk but no terminal chunk.
         let input = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n";
-        assert!(matches!(framer.feed(input), FrameResult::Incomplete));
-
-        // Server closes before terminal chunk.
-        match framer.feed_eof() {
-            FrameResult::Complete(resp, _) => {
+        match framer.feed(input) {
+            FrameResult::StreamBody(resp, _, spillover) => {
                 assert_eq!(resp.status, 200);
-                assert_eq!(resp.body.as_deref(), Some(b"hello".as_slice()));
+                assert!(resp.body.is_none());
+                assert_eq!(spillover, b"5\r\nhello\r\n");
             }
-            other => panic!("expected Complete from feed_eof, got {other:?}"),
+            other => panic!("expected StreamBody, got {other:?}"),
         }
     }
 
     #[test]
-    fn response_chunked_body_too_large() {
+    fn response_chunked_returns_stream_body_regardless_of_size() {
+        // Chunked responses always return StreamBody (no size check).
         let mut framer = ResponseFramer::new(5); // max 5 bytes
         let input =
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
-        assert!(matches!(framer.feed(input), FrameResult::BodyTooLarge));
+        match framer.feed(input) {
+            FrameResult::StreamBody(resp, _, spillover) => {
+                assert_eq!(resp.status, 200);
+
+                assert!(!spillover.is_empty());
+            }
+            other => panic!("expected StreamBody, got {other:?}"),
+        }
     }
 
     #[test]
-    fn response_read_until_close_body_too_large() {
+    fn response_read_until_close_returns_stream_body() {
         let mut framer = ResponseFramer::new(5); // max 5 bytes
-        let headers = b"HTTP/1.1 200 OK\r\n\r\n";
-        assert!(matches!(framer.feed(headers), FrameResult::Incomplete));
-        // Feed 10 bytes — exceeds max.
-        assert!(matches!(
-            framer.feed(b"0123456789"),
-            FrameResult::BodyTooLarge
-        ));
-    }
-
-    #[test]
-    fn response_feed_eof_on_awaiting_headers() {
-        let mut framer = ResponseFramer::new(1024);
-        // No data fed — feed_eof should return Incomplete (nothing to emit).
-        assert!(matches!(framer.feed_eof(), FrameResult::Incomplete));
+        let input = b"HTTP/1.1 200 OK\r\n\r\n0123456789";
+        match framer.feed(input) {
+            FrameResult::StreamBody(resp, _, spillover) => {
+                assert_eq!(resp.status, 200);
+                assert_eq!(spillover, b"0123456789");
+            }
+            other => panic!("expected StreamBody, got {other:?}"),
+        }
     }
 
     // ── Multi-feed chunked tests ─────────────────────────────────────────
 
     #[test]
-    fn response_chunked_multi_feed() {
-        // Chunked response arriving in multiple TCP segments.
+    fn response_chunked_multi_feed_returns_stream_body() {
+        // Chunked response with headers + partial body in first feed.
         let mut framer = ResponseFramer::new(1024);
 
-        // Feed 1: headers + partial chunk size
         let part1 = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhel";
-        assert!(matches!(framer.feed(part1), FrameResult::Incomplete));
-
-        // Feed 2: rest of chunk data + terminal chunk
-        let part2 = b"lo\r\n0\r\n\r\n";
-        match framer.feed(part2) {
-            FrameResult::Complete(resp, _) => {
+        match framer.feed(part1) {
+            FrameResult::StreamBody(resp, _, spillover) => {
                 assert_eq!(resp.status, 200);
-                assert_eq!(resp.body.as_deref(), Some(b"hello".as_slice()));
+                assert!(resp.body.is_none());
+                assert_eq!(spillover, b"5\r\nhel");
             }
-            other => panic!("expected Complete, got {other:?}"),
+            other => panic!("expected StreamBody, got {other:?}"),
         }
     }
 
     #[test]
-    fn response_chunked_multi_feed_multiple_chunks() {
-        // Two chunks, data split across three feeds.
+    fn response_chunked_headers_only_returns_stream_body() {
+        // Headers arrive alone — empty spillover.
         let mut framer = ResponseFramer::new(1024);
 
-        // Feed 1: headers + first chunk
-        let part1 = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n";
-        assert!(matches!(framer.feed(part1), FrameResult::Incomplete));
-
-        // Feed 2: second chunk partially
-        let part2 = b"6\r\n wo";
-        assert!(matches!(framer.feed(part2), FrameResult::Incomplete));
-
-        // Feed 3: rest of second chunk + terminal
-        let part3 = b"rld\r\n0\r\n\r\n";
-        match framer.feed(part3) {
-            FrameResult::Complete(resp, _) => {
+        let headers = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        match framer.feed(headers) {
+            FrameResult::StreamBody(resp, _, spillover) => {
                 assert_eq!(resp.status, 200);
-                assert_eq!(resp.body.as_deref(), Some(b"hello world".as_slice()));
+                assert!(spillover.is_empty());
             }
-            other => panic!("expected Complete, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn response_chunked_split_at_chunk_size_boundary() {
-        // Split exactly between chunk size line and chunk data.
-        let mut framer = ResponseFramer::new(1024);
-
-        let part1 = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\n";
-        assert!(matches!(framer.feed(part1), FrameResult::Incomplete));
-
-        let part2 = b"hello\r\n0\r\n\r\n";
-        match framer.feed(part2) {
-            FrameResult::Complete(resp, _) => {
-                assert_eq!(resp.body.as_deref(), Some(b"hello".as_slice()));
-            }
-            other => panic!("expected Complete, got {other:?}"),
+            other => panic!("expected StreamBody, got {other:?}"),
         }
     }
 
@@ -1367,27 +1252,29 @@ mod tests {
     #[test]
     fn response_chunked_byte_at_a_time() {
         // Worst case: feed one byte at a time.
+        // StreamBody is returned once the header boundary (\r\n\r\n) is found.
         let mut framer = ResponseFramer::new(1024);
         let full = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+
+        let header_end = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".len();
 
         for (i, &byte) in full.iter().enumerate() {
             match framer.feed(&[byte]) {
                 FrameResult::Incomplete => {}
-                FrameResult::Complete(resp, _) => {
-                    // Completes once the terminal chunk "0\r\n" is seen and
-                    // the trailing \r\n is consumed (if available).
-                    assert_eq!(resp.body.as_deref(), Some(b"hello".as_slice()));
-                    // Verify we're near the end (within last few bytes).
-                    assert!(
-                        i >= full.len() - 3,
-                        "completed too early at byte {i}/{}",
-                        full.len()
-                    );
+                FrameResult::StreamBody(resp, _, spillover) => {
+                    assert_eq!(resp.status, 200);
+                    assert!(resp.body.is_none());
+
+                    // StreamBody fires right at the header boundary.
+                    // The last byte of \r\n\r\n is at index header_end - 1.
+                    assert_eq!(i, header_end - 1);
+                    // Spillover is empty — no body bytes in the same feed.
+                    assert!(spillover.is_empty());
                     return;
                 }
                 other => panic!("unexpected result at byte {i}: {other:?}"),
             }
         }
-        panic!("never completed");
+        panic!("never got StreamBody");
     }
 }
