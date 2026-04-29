@@ -12,7 +12,7 @@ use std::{
 };
 
 use microsandbox_migration::{Migrator, MigratorTrait};
-use sea_orm::{ConnectOptions, Database, DatabaseConnection};
+use sea_orm::DatabaseConnection;
 use tokio::sync::OnceCell;
 
 use crate::MicrosandboxResult;
@@ -126,24 +126,31 @@ async fn connect_and_migrate(
             db_path.display()
         ))
     })?;
-    let db_url = format!("sqlite://{db_path_str}?mode=rwc");
 
-    let mut opts = ConnectOptions::new(&db_url);
-    opts.max_connections(max_connections)
-        .connect_timeout(Duration::from_secs(connect_timeout_secs))
-        .sqlx_logging(false);
+    // Use SqliteConnectOptions so WAL mode, busy_timeout, and foreign keys
+    // are applied to every connection the pool creates — not just the first.
+    // The old approach (executing PRAGMAs on the initial connection) left
+    // connections 2..N without busy_timeout, causing SQLITE_BUSY under
+    // concurrent sandbox access.
+    use sea_orm::sqlx::ConnectOptions as _;
+    use sea_orm::sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+    use std::str::FromStr;
 
-    let conn = Database::connect(opts).await?;
+    let sqlite_opts = SqliteConnectOptions::from_str(&format!("sqlite://{db_path_str}?mode=rwc"))
+        .map_err(|e| crate::MicrosandboxError::Custom(format!("database url: {e}")))?
+        .journal_mode(SqliteJournalMode::Wal)
+        .busy_timeout(Duration::from_secs(5))
+        .foreign_keys(true)
+        .disable_statement_logging();
 
-    // Enable WAL journal mode, busy timeout, and foreign key enforcement.
-    // WAL prevents SQLITE_BUSY when multiple processes (CLI + sandbox runtimes)
-    // access the same database concurrently.
-    use sea_orm::ConnectionTrait;
-    conn.execute(sea_orm::Statement::from_string(
-        sea_orm::DatabaseBackend::Sqlite,
-        microsandbox_utils::SQLITE_PRAGMAS,
-    ))
-    .await?;
+    let pool = SqlitePoolOptions::new()
+        .max_connections(max_connections)
+        .acquire_timeout(Duration::from_secs(connect_timeout_secs))
+        .connect_with(sqlite_opts)
+        .await
+        .map_err(|e| crate::MicrosandboxError::Custom(format!("database connect: {e}")))?;
+
+    let conn = sea_orm::SqlxSqliteConnector::from_sqlx_sqlite_pool(pool);
 
     Migrator::up(&conn, None).await?;
 

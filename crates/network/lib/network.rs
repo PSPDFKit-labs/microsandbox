@@ -213,17 +213,32 @@ impl SmoltcpNetwork {
             std::thread::Builder::new()
                 .name("smoltcp-poll".into())
                 .spawn(move || {
-                    stack::smoltcp_poll_loop(
-                        shared,
-                        poll_config,
-                        network_policy,
-                        dns_config,
-                        tls_state,
-                        published_ports,
-                        max_connections,
-                        tokio_handle,
-                        egress_handle,
-                    );
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        stack::smoltcp_poll_loop(
+                            shared,
+                            poll_config,
+                            network_policy,
+                            dns_config,
+                            tls_state,
+                            published_ports,
+                            max_connections,
+                            tokio_handle,
+                            egress_handle,
+                        );
+                    }));
+                    if let Err(e) = result {
+                        let msg = if let Some(s) = e.downcast_ref::<&str>() {
+                            s.to_string()
+                        } else if let Some(s) = e.downcast_ref::<String>() {
+                            s.clone()
+                        } else {
+                            "unknown panic".to_string()
+                        };
+                        tracing::error!(
+                            reason = %msg,
+                            "smoltcp poll thread panicked — all guest networking is dead"
+                        );
+                    }
                 })
                 .expect("failed to spawn smoltcp poll thread"),
         );

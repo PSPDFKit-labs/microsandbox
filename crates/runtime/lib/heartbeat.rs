@@ -42,13 +42,21 @@ impl HeartbeatReader {
 
     /// Check whether the sandbox is idle based on the heartbeat.
     ///
-    /// Returns `true` if `last_activity` is older than `timeout_secs`.
+    /// Returns `true` if `last_activity` is older than `timeout_secs` **and**
+    /// no exec sessions are running. A sandbox with active exec sessions is
+    /// never considered idle, even if the host hasn't sent serial data recently
+    /// (the guest may be making outbound API calls without host interaction).
+    ///
     /// Returns `false` if the heartbeat file doesn't exist (agent still booting).
     pub fn is_idle(&self, timeout_secs: u64) -> bool {
         let heartbeat = match self.read() {
             Some(hb) => hb,
             None => return false,
         };
+
+        if heartbeat.active_sessions > 0 {
+            return false;
+        }
 
         let elapsed = Utc::now()
             .signed_duration_since(heartbeat.last_activity)

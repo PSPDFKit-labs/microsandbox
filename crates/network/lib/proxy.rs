@@ -54,6 +54,12 @@ async fn tcp_proxy_task(
     shared: Arc<SharedState>,
 ) -> io::Result<()> {
     let stream = TcpStream::connect(dst).await?;
+    // Enable TCP keepalive to prevent NATs/firewalls from dropping idle flows.
+    let sock = socket2::SockRef::from(&stream);
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(std::time::Duration::from_secs(30))
+        .with_interval(std::time::Duration::from_secs(10));
+    let _ = sock.set_tcp_keepalive(&keepalive);
     let (mut server_rx, mut server_tx) = stream.into_split();
 
     let mut server_buf = vec![0u8; SERVER_READ_BUF_SIZE];

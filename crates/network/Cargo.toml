@@ -34,6 +34,7 @@ rustls = { workspace = true }
 rustls-native-certs = { workspace = true }
 rustls-pemfile = "2"
 serde = { workspace = true }
+socket2 = "0.5"
 smoltcp = { workspace = true, features = [
     "alloc",
     "async",

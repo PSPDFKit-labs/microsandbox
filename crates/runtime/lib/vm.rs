@@ -14,7 +14,7 @@ use std::time::Duration;
 use microsandbox_db::entity::run as run_entity;
 use microsandbox_filesystem::{DynFileSystem, PassthroughConfig, PassthroughFs};
 use msb_krun::VmBuilder;
-use sea_orm::{ColumnTrait, ConnectOptions, Database, DatabaseConnection, EntityTrait, Set};
+use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, Set};
 use serde::Serialize;
 
 use crate::console::{AgentConsoleBackend, ConsoleSharedState};
@@ -684,25 +684,29 @@ async fn connect_db(
     db_path: &std::path::Path,
     connect_timeout_secs: u64,
 ) -> RuntimeResult<DatabaseConnection> {
+    use sea_orm::sqlx::ConnectOptions as _;
+    use sea_orm::sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+    use std::str::FromStr;
+
     let url = format!("sqlite://{}?mode=rwc", db_path.display());
-    let opts = ConnectOptions::new(url)
+
+    // Use SqliteConnectOptions so WAL mode, busy_timeout, and foreign keys
+    // are set on every connection (not just the first in the pool).
+    let sqlite_opts = SqliteConnectOptions::from_str(&url)
+        .map_err(|e| RuntimeError::Custom(format!("database url: {e}")))?
+        .journal_mode(SqliteJournalMode::Wal)
+        .busy_timeout(Duration::from_secs(5))
+        .foreign_keys(true)
+        .disable_statement_logging();
+
+    let pool = SqlitePoolOptions::new()
         .max_connections(1)
-        .connect_timeout(Duration::from_secs(connect_timeout_secs))
-        .sqlx_logging(false)
-        .to_owned();
-    let db = Database::connect(opts)
+        .acquire_timeout(Duration::from_secs(connect_timeout_secs))
+        .connect_with(sqlite_opts)
         .await
         .map_err(|e| RuntimeError::Custom(format!("database connect: {e}")))?;
 
-    use sea_orm::ConnectionTrait;
-    db.execute(sea_orm::Statement::from_string(
-        sea_orm::DatabaseBackend::Sqlite,
-        microsandbox_utils::SQLITE_PRAGMAS,
-    ))
-    .await
-    .map_err(|e| RuntimeError::Custom(format!("database pragmas: {e}")))?;
-
-    Ok(db)
+    Ok(sea_orm::SqlxSqliteConnector::from_sqlx_sqlite_pool(pool))
 }
 
 /// Insert a run record into the database.

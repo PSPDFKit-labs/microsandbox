@@ -150,7 +150,10 @@ async fn connect_upstream(dst: SocketAddr, sni: &str) -> io::Result<TcpStream> {
         let mut last_err = None;
         for addr in &addrs {
             match TcpStream::connect(addr).await {
-                Ok(stream) => return Ok(stream),
+                Ok(stream) => {
+                    set_tcp_keepalive(&stream);
+                    return Ok(stream);
+                }
                 Err(e) => {
                     tracing::debug!(addr = %addr, sni = %sni, error = %e, "upstream connect failed, trying next");
                     last_err = Some(e);
@@ -163,7 +166,23 @@ async fn connect_upstream(dst: SocketAddr, sni: &str) -> io::Result<TcpStream> {
     }
 
     // Fallback: use original destination IP from the guest's connection.
-    TcpStream::connect(dst).await
+    let stream = TcpStream::connect(dst).await?;
+    set_tcp_keepalive(&stream);
+    Ok(stream)
+}
+
+/// Enable TCP keepalive on an upstream connection.
+///
+/// Keeps long-lived connections (SSE streams, chunked responses) alive
+/// through NATs and firewalls that silently drop idle TCP flows.
+fn set_tcp_keepalive(stream: &TcpStream) {
+    let sock = socket2::SockRef::from(stream);
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(std::time::Duration::from_secs(30))
+        .with_interval(std::time::Duration::from_secs(10));
+    if let Err(e) = sock.set_tcp_keepalive(&keepalive) {
+        tracing::debug!(error = %e, "failed to set TCP keepalive on upstream");
+    }
 }
 
 /// Bypass mode: plain TCP splice, no TLS termination.

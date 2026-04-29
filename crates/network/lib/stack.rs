@@ -273,8 +273,14 @@ pub fn smoltcp_poll_loop(
                             .evaluate_egress(dst, Protocol::Tcp)
                             .is_allow(),
                     };
-                    if allow && !conn_tracker.has_socket_for(&src, &dst) {
-                        conn_tracker.create_tcp_socket(src, dst, &mut sockets);
+                    if allow
+                        && !conn_tracker.has_socket_for(&src, &dst)
+                        && !conn_tracker.create_tcp_socket(src, dst, &mut sockets)
+                    {
+                        tracing::warn!(
+                            %src, %dst,
+                            "connection limit reached, dropping SYN (guest will see RST)"
+                        );
                     }
                     // Let smoltcp process — matching socket completes
                     // handshake, no socket means auto-RST.
